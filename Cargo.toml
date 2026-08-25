@@ -1,0 +1,30 @@
+[package]
+name = "yet-another-make"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+# This only activates mimalloc when compiling for a musl environment
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1.43"
+
+[[bin]]
+name = "yam"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dependencies]
+anstream = "1.0.0"
+anstyle = "1.0.14"
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive", "color"] }
+git2 = "0.21.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
