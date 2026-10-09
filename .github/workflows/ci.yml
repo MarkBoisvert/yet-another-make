@@ -63,6 +63,9 @@ jobs:
           echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
       - name: Check Clang version
         shell: bash
-        run: clang++ --version | tee /dev/stderr | grep -q "version 22\."
+        run: |
+          version="$(clang++ --version)"
+          echo "$version"
+          grep -q "version 22\." <<< "$version"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
