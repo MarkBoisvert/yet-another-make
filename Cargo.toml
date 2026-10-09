@@ -1,8 +1,14 @@
 [package]
 name = "yet-another-make"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+description = "A Cargo-style build tool for modern C++ (C++20 modules first). Installs the `yam` binary."
+repository = "https://github.com/MarkBoisvert/yet-another-make"
+readme = "README.md"
+keywords = ["cpp", "build-tool", "modules", "cargo", "clang"]
+categories = ["development-tools::build-utils", "command-line-utilities"]
+include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 # This only activates mimalloc when compiling for a musl environment
 [target.'cfg(target_env = "musl")'.dependencies]
