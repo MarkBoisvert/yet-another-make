@@ -44,12 +44,22 @@ YAM's goal is to collapse that stack:
 None of the above is implemented yet — the repository currently contains
 only the initial project skeleton.
 
+## Installing
+
+```sh
+cargo install yet-another-make
+```
+
+This installs the `yam` binary. Only `yam init` is available so far; see the
+[roadmap](https://github.com/MarkBoisvert/yet-another-make/blob/main/docs/roadmap.md)
+for what's next.
+
 ## Building from source
 
 YAM is written in Rust.
 
 ```sh
-git clone <this-repo>
+git clone https://github.com/MarkBoisvert/yet-another-make.git
 cd yet-another-make
 cargo build --release
 ```

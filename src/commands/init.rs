@@ -58,7 +58,10 @@ pub fn run(args: InitArgs) -> Result<()> {
     validate_package_name(&name)?;
 
     let is_lib = args.lib;
-    write_manifest(&manifest_path, &name)?;
+    // `import std` needs C++23; libs default to the lowest standard that has it so
+    // the most consumers can use them, bins to the newest.
+    let std = if is_lib { "c++23" } else { "c++26" };
+    write_manifest(&manifest_path, &name, std)?;
 
     let src_dir = path.join("src");
     fs::create_dir_all(&src_dir)
@@ -131,9 +134,9 @@ fn validate_package_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn write_manifest(manifest_path: &Path, name: &str) -> Result<()> {
+fn write_manifest(manifest_path: &Path, name: &str, std: &str) -> Result<()> {
     let contents = format!(
-        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nstd = \"c++20\"\n\n[dependencies]\n"
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nstd = \"{std}\"\n\n[dependencies]\n"
     );
     fs::write(manifest_path, contents)
         .with_context(|| format!("failed to write `{}`", manifest_path.display()))
