@@ -68,6 +68,7 @@ pub enum ColorWhen {
 }
 
 impl ColorWhen {
+    #[must_use]
     pub fn to_clap(self) -> clap::ColorChoice {
         match self {
             Self::Auto => clap::ColorChoice::Auto,

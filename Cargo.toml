@@ -14,9 +14,16 @@ include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-MIT", "
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = "0.1.43"
 
+[lib]
+name = "yet_another_make"
+path = "src/lib.rs"
+
 [[bin]]
 name = "yam"
 path = "src/main.rs"
+
+[lints]
+workspace = true
 
 [profile.release]
 opt-level = 3
@@ -34,3 +41,12 @@ git2 = "0.21.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[workspace]
+members = [".", "bench"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
