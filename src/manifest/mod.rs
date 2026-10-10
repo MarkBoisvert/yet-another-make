@@ -258,9 +258,9 @@ mod tests {
     #[test]
     fn invalid_std_is_reported() {
         assert_eq!(
-            parse_err("[package]\nname = \"x\"\nstd = \"c++11\"\n"),
-            "invalid 'package.std': invalid std 'c++11'; expected one of: c++17, c++20, \
-             c++23, c++26"
+            parse_err("[package]\nname = \"x\"\nstd = \"c++98\"\n"),
+            "invalid 'package.std': invalid std 'c++98'; expected one of: c++11, c++14, \
+             c++17, c++20, c++23, c++26"
         );
     }
 

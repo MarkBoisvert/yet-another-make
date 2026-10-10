@@ -144,7 +144,7 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - `[package]` has `name` (required), `version` (default `0.1.0`) and `std`.
     - **`std` is a minimum**, like Cargo's `rust-version`: it's the lowest C++
       standard the package's code and public interface need.
-      - Allowed values: `c++17` to `c++26`.
+      - Allowed values: `c++11` to `c++26`. C++98/03 are deliberately unsupported.
       - `yam init` writes `c++26` for a bin and `c++23` for a lib (the lowest that
         supports `import std`). `--legacy` may write lower.
     - **One standard per build graph:** compile the whole graph at
