@@ -260,8 +260,12 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       build systems. Repeated edits alternate content, so every run is a real change.
     - `bench.json` records the chosen leaf, mid and root units and how many units
       each scenario should rebuild.
+    - `bench configure <DIR>` sets up CMake + ninja with the same compiler and libc++
+      as yam. The modules style needs CMake 4.2 or newer, for
+      `CMAKE_CXX_STDLIB_MODULES_JSON`.
     - CI smoke test: generate a 10-unit project in each style and build it with CMake
-      + ninja (and with yam once #20 lands).
+      + ninja (and with yam once #20 lands). The modules style is built only where
+      CMake is 4.2 or newer.
 19. **Benchmark runner + baseline** (bench, perf)
     - `hyperfine` runs, with `--prepare` applying the edit, comparing `yam build`,
       `cmake --build` and `ninja` alone. All use the same compiler, flags and `-j`.

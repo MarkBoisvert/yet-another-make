@@ -14,16 +14,16 @@ use crate::project::{self, Style};
 pub const BUILD_DIR: &str = "build-cmake";
 
 /// The `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` value for each CMake version, from that
-/// version's `Help/dev/experimental.rst`.
-const IMPORT_STD_GATES: [(&str, &str); 7] = [
-    ("3.30", "0e5b6991-d74f-4b3d-a41c-cf096e0b2508"),
-    ("3.31", "0e5b6991-d74f-4b3d-a41c-cf096e0b2508"),
-    ("4.0", "a9e1cf81-9932-4810-974b-6eccaf14e457"),
-    ("4.1", "d0edc3af-4c50-42ea-a356-e2862fe7a444"),
+/// version's `Help/dev/experimental.rst`. Module projects need CMake 4.2 or newer,
+/// the first with `CMAKE_CXX_STDLIB_MODULES_JSON`.
+const IMPORT_STD_GATES: [(&str, &str); 3] = [
     ("4.2", "d0edc3af-4c50-42ea-a356-e2862fe7a444"),
     ("4.3", "451f2fe2-a8a2-47c3-bc32-94786d8fc91b"),
     ("4.4", "f35a9ac6-8463-4d38-8eec-5d6008153e7d"),
 ];
+
+/// The oldest CMake that can build the modules style (see [`IMPORT_STD_GATES`]).
+const MIN_MODULES_CMAKE: (u32, u32) = (4, 2);
 
 /// Configure `dir/build-cmake` with ninja.
 ///
@@ -68,9 +68,18 @@ pub fn configure(dir: &Path, release: bool, gate: Option<&str>) -> Result<PathBu
     }
 
     if meta.style == Style::Modules {
+        let version = cmake_version()?;
+        if !supports_modules(&version) {
+            bail!(
+                "the modules style needs CMake {}.{} or newer (for \
+                 CMAKE_CXX_STDLIB_MODULES_JSON), but found {version}",
+                MIN_MODULES_CMAKE.0,
+                MIN_MODULES_CMAKE.1
+            );
+        }
         let gate = match gate {
             Some(gate) => gate.to_string(),
-            None => import_std_gate(&cmake_version()?)?.to_string(),
+            None => import_std_gate(&version)?.to_string(),
         };
         // CMake resolves the manifest's relative paths against the file it's given,
         // which breaks on Debian's layout, so hand it one with absolute paths.
@@ -110,6 +119,15 @@ fn parse_cmake_version(text: &str) -> Option<String> {
     let version = text.lines().next()?.strip_prefix("cmake version ")?;
     let mut parts = version.split('.');
     Some(format!("{}.{}", parts.next()?, parts.next()?))
+}
+
+/// Whether CMake `version` (`major.minor`) can build the modules style.
+fn supports_modules(version: &str) -> bool {
+    let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= MIN_MODULES_CMAKE,
+        _ => false,
+    }
 }
 
 fn import_std_gate(version: &str) -> Result<&'static str> {
@@ -173,8 +191,10 @@ mod tests {
             import_std_gate("4.4").unwrap(),
             "f35a9ac6-8463-4d38-8eec-5d6008153e7d"
         );
-        let err = import_std_gate("3.28").unwrap_err().to_string();
+        let err = import_std_gate("4.9").unwrap_err().to_string();
         assert!(err.contains("--import-std-gate"), "{err}");
+        assert!(supports_modules("4.2") && supports_modules("5.0"));
+        assert!(!supports_modules("3.31") && !supports_modules("4.1"));
     }
 
     /// Generates a small project in each style and builds it with CMake + ninja. CI
@@ -189,7 +209,19 @@ mod tests {
             eprintln!("skipping: cmake, ninja or the toolchain is missing");
             return;
         }
-        for style in [Style::Modules, Style::Legacy] {
+        // Ubuntu's runner ships CMake 3.31, too old for the modules style.
+        let modules = cmake_version().is_ok_and(|v| {
+            supports_modules(&v) && IMPORT_STD_GATES.iter().any(|(known, _)| *known == v)
+        });
+        if !modules {
+            eprintln!("skipping the modules style: needs CMake 4.2 to 4.4");
+        }
+        let styles = if modules {
+            vec![Style::Modules, Style::Legacy]
+        } else {
+            vec![Style::Legacy]
+        };
+        for style in styles {
             let temp = tempfile::tempdir().unwrap();
             let dir = temp.path();
             project::generate(dir, &Meta::new(style, 10, 3, 2, 1)).unwrap();
