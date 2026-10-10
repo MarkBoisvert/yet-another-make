@@ -6,6 +6,7 @@ pub mod cli;
 pub mod commands;
 pub mod manifest;
 pub mod style;
+pub mod toolchain;
 
 use std::process::ExitCode;
 

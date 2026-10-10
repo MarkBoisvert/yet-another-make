@@ -45,7 +45,10 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
    or `[lib]`/`[[bin]]` overrides with `sources`/`exclude` globs.
 2. **Discover sources** by expanding globs. Directory listings and their mtimes are
    kept in the state file, so unchanged directories aren't walked again (#20).
-3. **Locate the toolchain**: `clang++`, `clang-scan-deps` and `std.cppm` (#16).
+3. **Locate the toolchain**: `clang++`, `clang-scan-deps` and `std.cppm` (#16). Each
+   tool comes from an override (`YAM_CXX`, `YAM_CLANG_SCAN_DEPS`), then the bundled
+   toolchain, then `PATH`; `clang-scan-deps` is first looked for next to `clang++`.
+   `std.cppm` comes from `clang++ -print-file-name=libc++.modules.json`.
 4. **Compute each project's standard** (see
    [One standard per project](#one-standard-per-project--decided)).
 5. **Ensure a `std.pcm`** for each distinct standard in use (see [std.pcm](#stdpcm--decided)).
