@@ -30,6 +30,9 @@ GitHub issue `#N`.
 - **Compatibility guarantee:** a lib built and published by yam works when linked
   into any other yam build on the same toolchain line. Prebuilt and closed-source
   binaries are first-class (#33).
+- **Allocator: mimalloc on every target.** Official Linux release binaries are
+  static musl + mimalloc; `cargo install` builds natively and still gets mimalloc
+  (#8, #27).
 - **Portability rule:** use Rust `std` first, then a well-maintained crate, and raw
   OS calls only as a last resort.
 
@@ -108,10 +111,21 @@ yet-another-make/
    - Done manually with `cargo publish`, only after explicit approval.
 8. **Release automation: crates.io + GitHub Releases** (infra)
    - On a `v*` tag, publish to crates.io via **Trusted Publishing** (GitHub OIDC, with
-     no long-lived token).
-   - Attach prebuilt `yam` binaries for Linux (musl static), macOS and Windows to a
-     GitHub Release, using `cargo-dist` or an equivalent.
-   - `cargo binstall yet-another-make` uses those binaries.
+     no long-lived token). Once it works, revoke the manual 0.0.1 publish token.
+   - Attach prebuilt `yam` binaries to a GitHub Release, using `cargo-dist` or an
+     equivalent:
+     - **Linux: musl only** (`x86_64-` and `aarch64-unknown-linux-musl`), static and
+       using mimalloc. No `*-linux-gnu` binaries are published.
+     - macOS (`aarch64-apple-darwin`) and Windows (`x86_64-pc-windows-msvc`).
+   - Release CI checks that every Linux artifact is static and links mimalloc.
+   - A CI job on an Ubuntu (glibc) runner checks that `cargo binstall
+     yet-another-make` installs the **musl** binary (binstall's fallback when there's
+     no gnu artifact). binstall metadata comes from cargo-dist or
+     `[package.metadata.binstall]`.
+   - `cargo install` stays a native host build: building for musl needs a musl C
+     toolchain for `libgit2-sys` and `mimalloc`. The README documents `cargo binstall`
+     (recommended), `cargo install`, and the opt-in
+     `cargo install --target x86_64-unknown-linux-musl yet-another-make`.
 9. **Reconcile `cargo install` with `docs/release.md`** (docs, design)
    - `cargo install` places `yam` in `~/.cargo/bin`, with no system layout alongside
      it.
@@ -263,6 +277,8 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Profile no-op builds with `perf` and `cargo flamegraph`.
     - Remove allocations from the per-file check loop; parallelize `stat` calls if it
       helps.
+    - Confirm that mimalloc beats the platform allocator on glibc, macOS and Windows.
+      It's enabled on all targets; drop it per target if the data says otherwise.
 28. **Perf gate: beat ninja** (bench, perf)
     - On 100, 1k and 10k module projects:
       - no-op `yam build` ≤ `ninja` no-op

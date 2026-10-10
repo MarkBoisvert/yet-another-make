@@ -1,5 +1,5 @@
-// Instructs Rust to use mimalloc instead of musl's default allocator
-#[cfg(target_env = "musl")]
+// mimalloc on every target: a big win over musl's allocator in the static Linux
+// release builds, and expected to help elsewhere too (confirmed by #27's profiling).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

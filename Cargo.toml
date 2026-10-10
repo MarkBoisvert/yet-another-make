@@ -10,10 +10,6 @@ keywords = ["cpp", "build-tool", "modules", "cargo", "clang"]
 categories = ["development-tools::build-utils", "command-line-utilities"]
 include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
-# This only activates mimalloc when compiling for a musl environment
-[target.'cfg(target_env = "musl")'.dependencies]
-mimalloc = "0.1.43"
-
 [lib]
 name = "yet_another_make"
 path = "src/lib.rs"
@@ -36,6 +32,7 @@ panic = "abort"
 anstream = "1.0.0"
 anstyle = "1.0.14"
 anyhow = "1.0.104"
+mimalloc = "0.1.43"
 clap = { version = "4.6.6", features = ["derive", "color"] }
 git2 = "0.21.0"
 
