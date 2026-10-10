@@ -1,0 +1,3 @@
+# Pin the formatting style so `cargo fmt` output doesn't depend on the toolchain
+# default. Everything else uses rustfmt's defaults.
+style_edition = "2024"
