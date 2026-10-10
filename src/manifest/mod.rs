@@ -235,8 +235,8 @@ mod tests {
             }
         );
         assert_eq!(manifest.lib, None);
-        assert!(manifest.bins.is_empty());
-        assert!(manifest.dependencies.is_empty());
+        assert_eq!(manifest.bins, Vec::<TargetSpec>::new());
+        assert_eq!(manifest.dependencies, BTreeMap::new());
     }
 
     #[test]
