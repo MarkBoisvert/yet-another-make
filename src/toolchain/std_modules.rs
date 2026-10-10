@@ -9,6 +9,8 @@ use serde::Deserialize;
 
 use super::{Tool, ToolchainError};
 
+const MANIFEST_NAME: &str = "libc++.modules.json";
+
 /// The located module sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StdModules {
@@ -53,19 +55,42 @@ pub(super) fn locate(cxx: &Tool) -> Result<StdModules, ToolchainError> {
         major: cxx.version.major,
     };
     let output = Command::new(&cxx.path)
-        .args(["-stdlib=libc++", "-print-file-name=libc++.modules.json"])
+        .args([
+            "-stdlib=libc++",
+            &format!("-print-file-name={MANIFEST_NAME}"),
+        ])
         .output()
         .map_err(|_| none())?;
     let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    // Clang echoes the bare name back when it can't find the file.
-    if !output.status.success() || !reported.is_absolute() || !reported.is_file() {
-        return Err(none());
-    }
     // `<prefix>/bin/clang++` → `<prefix>/lib`.
     let install_lib = fs::canonicalize(&cxx.path)
         .ok()
         .and_then(|real| Some(real.parent()?.parent()?.join("lib")));
-    from_manifest(&reported, install_lib.as_deref())
+    // Clang echoes the bare name back when it can't find the file. Some installs keep
+    // it where the driver doesn't look, e.g. Homebrew's `lib/c++/`.
+    let manifest = (output.status.success() && reported.is_absolute() && reported.is_file())
+        .then_some(reported)
+        .or_else(|| install_lib.as_deref().and_then(find_in_lib))
+        .ok_or_else(none)?;
+    from_manifest(&manifest, install_lib.as_deref())
+}
+
+/// `lib/libc++.modules.json`, or the first `lib/*/libc++.modules.json` (Homebrew's
+/// `lib/c++/`, or a per-triple runtime directory such as `lib/x86_64-unknown-linux-gnu/`).
+fn find_in_lib(lib: &Path) -> Option<PathBuf> {
+    let direct = lib.join(MANIFEST_NAME);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let mut dirs: Vec<PathBuf> = fs::read_dir(lib)
+        .ok()?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .map(|dir| dir.join(MANIFEST_NAME))
+        .find(|path| path.is_file())
 }
 
 /// Read the manifest at `path`.
@@ -230,6 +255,20 @@ mod tests {
 
         write(&manifest, "not json");
         assert!(from_manifest(&manifest, None).is_err());
+    }
+
+    #[test]
+    fn finds_the_manifest_under_the_toolchain_lib_dir() {
+        let temp = tempdir().unwrap();
+        let lib = temp.path().join("lib");
+        fs::create_dir_all(lib.join("clang")).unwrap();
+        assert_eq!(find_in_lib(&lib), None);
+
+        write(&lib.join("c++").join(MANIFEST_NAME), MANIFEST);
+        assert_eq!(find_in_lib(&lib), Some(lib.join("c++").join(MANIFEST_NAME)));
+
+        write(&lib.join(MANIFEST_NAME), MANIFEST);
+        assert_eq!(find_in_lib(&lib), Some(lib.join(MANIFEST_NAME)));
     }
 
     #[test]
