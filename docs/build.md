@@ -224,17 +224,22 @@ target/
 
 ## Performance gates
 
-Measured with the #18/#19 harness. It generates equivalent `Yam.toml` and
-CMake + ninja projects of 100, 1k and 10k modules and times them with `hyperfine`.
+Measured with the #18/#19 harness. It generates one source tree per size (100, 1k and
+10k units) and style, containing both a `Yam.toml` and a `CMakeLists.txt`, and times
+each scenario with `hyperfine`. There are two styles: **modules** (`import std`,
+`.cppm` + `.cpp`) and **legacy** (`.hpp` + `.cpp`).
 
-| Scenario | Gate (#28) |
-|---|---|
-| No-op build | `yam build` ≤ `ninja` alone (excluding CMake regeneration) |
-| One leaf file edited | `yam build` ≤ `cmake --build` |
-| One root module interface edited | `yam build` ≤ `cmake --build` |
-| Cold build | Reported, not gated (compiling dominates) |
+| Scenario | Change | Gate (#28) |
+|---|---|---|
+| `noop` | nothing | `yam build` ≤ `ninja` alone (excluding CMake regeneration) |
+| `touch` | root interface mtime only | `yam build` ≤ `ninja` alone |
+| `leaf-impl`, `leaf-iface` | one leaf unit | `yam build` ≤ `cmake --build` |
+| `impl-1pct`, `impl-10pct` | function bodies in 1% / 10% of units | `yam build` ≤ `cmake --build` |
+| `mid-iface`, `root-iface` | an interface with median / all dependents | `yam build` ≤ `cmake --build` |
+| `add-unit` | a new leaf unit | `yam build` ≤ `cmake --build` |
+| `cold` | clean build | Reported, not gated (compiling dominates) |
 
-**M2 isn't done until every gate passes at every size.** Results and the machine they
+**M2 isn't done until every gate passes at every size, in both styles.** Results and the machine they
 ran on are recorded in `docs/bench.md`. #27 profiles the no-op path (`perf`,
 `cargo flamegraph`) for allocations and `stat` cost, and checks that mimalloc beats
 the platform allocator on each OS.
