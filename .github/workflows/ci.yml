@@ -40,9 +40,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Clang 22 isn't used by any test yet; it's installed now so later integration
-      # tests (#16, #17) can rely on it being on PATH. Each OS uses its native package
-      # source, which is far smaller than LLVM's ~2 GB release tarballs.
+      # Toolchain discovery's test (src/toolchain) must find Clang 22, clang-scan-deps
+      # and libc++'s std module sources on Linux and macOS when CI is set. Windows has
+      # no libc++ yet, so there it may skip. Each OS uses its native package source,
+      # which is far smaller than LLVM's ~2 GB release tarballs.
       - name: Install Clang 22 (Linux)
         if: runner.os == 'Linux'
         run: |
