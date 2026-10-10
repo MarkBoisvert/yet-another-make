@@ -2,6 +2,10 @@
 
 ## Overview
 
+In these docs a **package** is the published artifact that `yam publish` produces
+from a **project** (the source tree with a `Yam.toml`); see
+[glossary.md](glossary.md).
+
 `yam` is a package manager in the spirit of Cargo (manifest-driven dependency
 declarations, lockfile-based reproducible resolution, `yam add`/`yam build`
 workflow), but it diverges from Cargo in how packages are distributed:
@@ -31,7 +35,7 @@ naming/tagging, digest pinning) should stay consistent with whatever
 * Reuses existing, battle-tested registry infrastructure (auth, storage,
   CDN, garbage collection, visibility/permissions) instead of `yam` having
   to run and operate its own index + blob storage service.
-* GitHub repos already commonly host the package source *and* can host its
+* GitHub repos already commonly host the project source *and* can host its
   published artifacts (via GHCR) under the same namespace/auth model,
   simplifying publishing workflows for open-source `yam` packages.
 * OCI artifacts are content-addressed and immutable by digest, which maps

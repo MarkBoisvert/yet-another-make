@@ -4,7 +4,8 @@
 whose headline goal is to **out-perform CMake + ninja**. It is written in Rust. An
 earlier C++ prototype serves as the behavioral spec for M1. Its design docs
 (`release.md`, `packages.md`, `toolchains.md` and `modules.md`) carry forward into
-this repo's `docs/`.
+this repo's `docs/`. Terms (project, target, package, dependency, build graph) are
+defined in [glossary.md](glossary.md).
 
 Issues are numbered in creation order, so on a fresh GitHub repo `#N` here matches
 GitHub issue `#N`.
@@ -26,7 +27,8 @@ GitHub issue `#N`.
   exits only when yam beats ninja (#28).
 - **Targets use Cargo-style conventions**, with glob overrides for porting existing
   code (#10).
-- **`std` is a minimum, and there is one standard per build graph** (#10).
+- **`std` is a minimum, and each project compiles at one standard**, raised only by
+  its direct dependencies (#10).
 - **Compatibility guarantee:** a lib built and published by yam works when linked
   into any other yam build on the same toolchain line. Prebuilt and closed-source
   binaries are first-class (#33).
@@ -141,23 +143,25 @@ yet-another-make/
 Acceptance criteria quote the C++ prototype's behavior, which becomes the first tests.
 
 10. **`Yam.toml` model + parsing** (manifest)
-    - `[package]` has `name` (required), `version` (default `0.1.0`) and `std`.
+    - `[project]` has `name` (required), `version` (default `0.1.0`) and `std`.
     - **`std` is a minimum**, like Cargo's `rust-version`: it's the lowest C++
-      standard the package's code and public interface need.
+      standard the project's own code and public interface need.
       - Allowed values: `c++11` to `c++26`. C++98/03 are deliberately unsupported.
       - `yam init` writes `c++26` for a bin and `c++23` for a lib (the lowest that
         supports `import std`). `--legacy` may write lower.
-    - **One standard per build graph:** compile the whole graph at
-      `effective_std = max(root std, every dependency's std)`.
-      - A `c++20` bin that depends on a `c++26` lib builds at c++26, with a `note:`
-        naming the dependency that raised it.
-      - It's an error only if `effective_std` exceeds what the pinned toolchain
+    - **One standard per project:** all of a project's own files compile at
+      `project_std = max(own std, declared std of each direct dependency)`.
+      - A `c++20` app that depends on a `c++26` module library builds at c++26, with
+        a `note:` naming the dependency that raised it.
+      - A `c++11` library used by a `c++26` app still compiles its own files at
+        c++11; only the app is at c++26.
+      - Indirect dependencies don't raise it. A dependency's declared `std` is a
+        promise about its public interface, checked at publish time (#33).
+      - It's an error only if `project_std` exceeds what the pinned toolchain
         supports.
-      - Rationale: Clang rejects module interface files built under a different
-        `-std`, and `std.pcm` is per-`-std`. One standard means one `std.pcm` and one
-        compiled interface per module, which is both compatible and fastest.
+      - The rationale and examples are in `docs/build.md`.
     - **Cargo-style target conventions.** No target table is needed:
-      - `src/main.cpp` gives a bin named after the package.
+      - `src/main.cpp` gives a bin named after the project.
       - `src/lib.cppm` (or `src/lib.cpp`) gives a lib.
       - Each `src/bin/<name>.cpp` gives an extra bin.
     - Default source sets:
@@ -171,7 +175,7 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       - When `sources` is set, it replaces the conventional source set entirely.
     - `[dependencies.<name>]` accepts `version`, `path`, `git` and `rev`. It's parsed
       but **reserved** (no effect) until M4.
-    - Error to match: `missing required field 'package.name'`.
+    - Error to match: `missing required field 'project.name'`.
 11. **Manifest validation diagnostics** (manifest)
     - Errors for an empty name or version, an invalid `std` value, or an invalid
       target name or path.
@@ -204,6 +208,8 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       - The `--lib` template becomes `src/lib.cppm` with `export module <name>;`.
       - `--lib --legacy` gives `src/lib.cpp` plus `include/<name>.hpp`.
       - Bin templates use `std::println`.
+      - Messages say "project": `Created binary (application) project` and
+        "cannot be run on existing yam projects".
 15. **`yam clean`** (cli)
     - Arguments: `[PATH]`, `--release` (release artifacts only), `--dry-run` and
       `-v/--verbose`.
@@ -242,7 +248,9 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       - the conventional source sets and `src/bin/*`
       - `sources`/`exclude` globs
       - `include-dirs`
-      - bins linking the package lib
+      - bins linking the project's lib
+    - Compile each project at its project standard (#10), including local-project
+      dependencies built from source.
     - Add `links` and `link-dirs` on `[lib]`/`[[bin]]`, for system and vendor
       (closed-source) libraries, e.g. `pthread`, `z` or a vendor `.a`. This is a
       manual escape hatch until M4 packages exist.
@@ -265,7 +273,8 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Ingest depfiles into the state file after each compile, the way `.ninja_deps`
       works.
 24. **Build graph + staleness** (engine)
-    - Graph of modules, objects, `std.pcm` and link steps.
+    - Graph of modules, objects, `std.pcm` and link steps, with one `std.pcm` per
+      distinct project standard that uses `import std`.
     - Staleness from mtime with a content-hash fallback, plus a command-line hash.
     - Cycles are reported with the module chain.
 25. **Parallel scheduler** (engine, perf)
@@ -315,7 +324,10 @@ Start the #33 design work alongside M2, so it is ready when #28 passes.
     - **Requirement — compatibility guarantee:** a lib built and published by yam
       works when linked into any other yam build on the same toolchain line.
       Mechanisms already decided:
-      - `std` is a minimum, and the whole graph is compiled at the max (#10).
+      - `std` is a minimum, and each project compiles at
+        `max(own std, direct dependencies' declared std)` (#10).
+      - `yam publish` turns a **project** into a **package**. A dependency resolves to
+        a package from a registry or to a local project built from source.
       - Packages ship interface *source*, never a compiled module interface.
       - At publish time, `yam-iface` compiles the extracted interface at the declared
         minimum `std`, so the minimum is proven, not just claimed.
@@ -324,7 +336,7 @@ Start the #33 design work alongside M2, so it is ready when #28 passes.
         - A package ships its declarations-only interface (`.cppm` from `yam-iface`,
           or headers for legacy code) plus prebuilt `.a`/`.so` for each target
           triplet, as one OCI image index per package.
-        - The consumer compiles only the interface, at `effective_std`, and links the
+        - The consumer compiles only the interface, at its own project standard, and links the
           prebuilt binary. This relies on libc++ keeping its ABI stable across `-std`
           modes.
         - Rebuilding from source is an **optional fallback**, only when the package
@@ -343,7 +355,7 @@ Start the #33 design work alongside M2, so it is ready when #28 passes.
         A mismatch is a clear error, for example "foo 1.2 was built for libc++ ABI
         v1 / clang 22; this build uses …".
       - **ODR guard:** exported inline and template bodies are compiled in the
-        consumer at `effective_std`. At publish, `yam-iface` warns when they depend
+        consumer at the consumer's project standard. At publish, `yam-iface` warns when they depend
         on `__cplusplus` or feature-test macros.
       - Debug and release consumers can link the same release binary, since libc++
         hardening modes don't change the ABI. Publishers may also ship a debug

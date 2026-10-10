@@ -143,7 +143,7 @@ fn validate_package_name(name: &str) -> Result<()> {
 
 fn write_manifest(manifest_path: &Path, name: &str, std: &str) -> Result<()> {
     let contents = format!(
-        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nstd = \"{std}\"\n\n[dependencies]\n"
+        "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nstd = \"{std}\"\n\n[dependencies]\n"
     );
     fs::write(manifest_path, contents)
         .with_context(|| format!("failed to write `{}`", manifest_path.display()))
@@ -233,6 +233,24 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         git2::Repository::init(&repo).unwrap();
         repo
+    }
+
+    #[test]
+    fn generated_manifests_parse_with_the_manifest_model() {
+        use crate::manifest::{CppStd, Manifest};
+
+        let temp = tempdir().unwrap();
+        let bin = temp.path().join("app");
+        run(&args(bin.clone(), Some(Vcs::None))).unwrap();
+        let manifest = Manifest::load(&bin).unwrap();
+        assert_eq!(manifest.project.name, "app");
+        assert_eq!(manifest.project.std, CppStd::Cpp26);
+
+        let lib = temp.path().join("mylib");
+        let mut lib_args = args(lib.clone(), Some(Vcs::None));
+        lib_args.lib = true;
+        run(&lib_args).unwrap();
+        assert_eq!(Manifest::load(&lib).unwrap().project.std, CppStd::Cpp23);
     }
 
     #[test]

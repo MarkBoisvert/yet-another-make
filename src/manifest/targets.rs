@@ -1,8 +1,8 @@
-//! Turn a manifest plus the package's files into concrete build targets, applying
+//! Turn a manifest plus the project's files into concrete build targets, applying
 //! Cargo-style conventions where the manifest doesn't say otherwise:
 //!
-//! * `src/main.cpp` is a binary named after the package.
-//! * `src/lib.cppm` (or `src/lib.cpp`) is the package library.
+//! * `src/main.cpp` is a binary named after the project.
+//! * `src/lib.cppm` (or `src/lib.cpp`) is the project library.
 //! * each `src/bin/<name>.cpp` is an extra binary named `<name>`.
 //!
 //! `[lib]` and `[[bin]]` tables override names, entry files and source sets.
@@ -27,7 +27,7 @@ pub enum TargetKind {
     Bin,
 }
 
-/// A fully resolved build target. Paths and globs are relative to the package root,
+/// A fully resolved build target. Paths and globs are relative to the project root,
 /// with `/` separators.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -38,11 +38,11 @@ pub struct Target {
     pub sources: Vec<String>,
     pub exclude: Vec<String>,
     pub include_dirs: Vec<PathBuf>,
-    /// For binaries: whether the package library is linked in.
+    /// For binaries: whether the project library is linked in.
     pub links_lib: bool,
 }
 
-/// Resolve the package's targets: the library first (if any), then binaries in
+/// Resolve the project's targets: the library first (if any), then binaries in
 /// manifest order, then binaries discovered by convention, sorted by name.
 ///
 /// Doesn't check that explicit paths exist or that names are unique; manifest
@@ -50,19 +50,19 @@ pub struct Target {
 ///
 /// # Errors
 ///
-/// Fails if `src/bin` can't be listed, or if the package has no targets at all.
+/// Fails if `src/bin` can't be listed, or if the project has no targets at all.
 pub fn resolve_targets(manifest: &Manifest, root: &Path) -> Result<Vec<Target>, ManifestError> {
-    let package_name = &manifest.package.name;
+    let project_name = &manifest.project.name;
     let mut targets = Vec::new();
 
-    let lib = resolve_lib(manifest.lib.as_ref(), package_name, root);
+    let lib = resolve_lib(manifest.lib.as_ref(), project_name, root);
     let has_lib = lib.is_some();
     targets.extend(lib);
 
     for spec in &manifest.bins {
         // `Manifest::from_toml_str` guarantees every `[[bin]]` has a name.
         let name = spec.name.clone().unwrap_or_default();
-        let default_entry = if name == *package_name {
+        let default_entry = if name == *project_name {
             PathBuf::from(MAIN_ENTRY)
         } else {
             Path::new(BIN_DIR).join(format!("{name}.cpp"))
@@ -70,7 +70,7 @@ pub fn resolve_targets(manifest: &Manifest, root: &Path) -> Result<Vec<Target>, 
         targets.push(bin_target(name, spec, default_entry, has_lib));
     }
 
-    for (name, entry) in discover_bins(package_name, root)? {
+    for (name, entry) in discover_bins(project_name, root)? {
         let claimed = manifest.bins.iter().any(|spec| {
             spec.name.as_deref() == Some(name.as_str()) || spec.path.as_deref() == Some(&entry)
         });
@@ -87,7 +87,7 @@ pub fn resolve_targets(manifest: &Manifest, root: &Path) -> Result<Vec<Target>, 
     Ok(targets)
 }
 
-fn resolve_lib(spec: Option<&TargetSpec>, package_name: &str, root: &Path) -> Option<Target> {
+fn resolve_lib(spec: Option<&TargetSpec>, project_name: &str, root: &Path) -> Option<Target> {
     let found_entry = LIB_ENTRIES
         .iter()
         .map(PathBuf::from)
@@ -116,7 +116,7 @@ fn resolve_lib(spec: Option<&TargetSpec>, package_name: &str, root: &Path) -> Op
     };
 
     Some(Target {
-        name: spec.name.unwrap_or_else(|| package_name.to_string()),
+        name: spec.name.unwrap_or_else(|| project_name.to_string()),
         kind: TargetKind::Lib,
         entry,
         sources,
@@ -144,10 +144,10 @@ fn bin_target(name: String, spec: &TargetSpec, default_entry: PathBuf, links_lib
 }
 
 /// Binaries present by convention: `src/main.cpp`, then `src/bin/*.cpp` by name.
-fn discover_bins(package_name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>, ManifestError> {
+fn discover_bins(project_name: &str, root: &Path) -> Result<Vec<(String, PathBuf)>, ManifestError> {
     let mut bins = Vec::new();
     if root.join(MAIN_ENTRY).is_file() {
-        bins.push((package_name.to_string(), PathBuf::from(MAIN_ENTRY)));
+        bins.push((project_name.to_string(), PathBuf::from(MAIN_ENTRY)));
     }
 
     let bin_dir = root.join(BIN_DIR);
@@ -198,7 +198,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn package(files: &[&str]) -> tempfile::TempDir {
+    fn project(files: &[&str]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for file in files {
             let path = dir.path().join(file);
@@ -209,11 +209,11 @@ mod tests {
     }
 
     fn manifest(extra: &str) -> Manifest {
-        Manifest::from_toml_str(&format!("[package]\nname = \"pkg\"\n{extra}")).unwrap()
+        Manifest::from_toml_str(&format!("[project]\nname = \"pkg\"\n{extra}")).unwrap()
     }
 
     fn resolve(extra: &str, files: &[&str]) -> Vec<Target> {
-        let dir = package(files);
+        let dir = project(files);
         resolve_targets(&manifest(extra), dir.path()).unwrap()
     }
 
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn main_cpp_is_a_bin_named_after_the_package() {
+    fn main_cpp_is_a_bin_named_after_the_project() {
         let targets = resolve("", &["src/main.cpp"]);
         assert_eq!(
             targets,
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn lib_cppm_is_the_package_library() {
+    fn lib_cppm_is_the_project_library() {
         let targets = resolve("", &["src/lib.cppm", "src/detail/impl.cpp"]);
         assert_eq!(
             targets,
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn no_targets_is_an_error() {
-        let dir = package(&["src/notes.txt"]);
+        let dir = project(&["src/notes.txt"]);
         let err = resolve_targets(&manifest(""), dir.path()).unwrap_err();
         assert!(matches!(err, ManifestError::NoTargets { .. }), "{err:?}");
     }

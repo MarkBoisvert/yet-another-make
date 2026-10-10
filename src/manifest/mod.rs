@@ -12,7 +12,7 @@ use serde::Deserialize;
 pub use cpp_std::{CppStd, ParseCppStdError};
 pub use targets::{Target, TargetKind, resolve_targets};
 
-/// The manifest's file name, at the root of every package.
+/// The manifest's file name, at the root of every project.
 pub const MANIFEST_FILE_NAME: &str = "Yam.toml";
 
 /// The `version` used when a manifest doesn't specify one.
@@ -21,7 +21,7 @@ pub const DEFAULT_VERSION: &str = "0.1.0";
 /// A parsed `Yam.toml`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
-    pub package: Package,
+    pub project: Project,
     /// The `[lib]` table, if present. A library can also exist purely by
     /// convention (see [`resolve_targets`]).
     pub lib: Option<TargetSpec>,
@@ -32,12 +32,12 @@ pub struct Manifest {
     pub dependencies: BTreeMap<String, DependencySpec>,
 }
 
-/// The `[package]` table.
+/// The `[project]` table.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Package {
+pub struct Project {
     pub name: String,
     pub version: String,
-    /// The minimum C++ standard the package needs.
+    /// The minimum C++ standard the project's code and public interface need.
     pub std: CppStd,
 }
 
@@ -49,13 +49,13 @@ pub struct TargetSpec {
     pub name: Option<String>,
     /// The entry file: `main()` for a binary, the primary interface for a library.
     pub path: Option<PathBuf>,
-    /// Globs relative to the package root. When set, they replace the conventional
+    /// Globs relative to the project root. When set, they replace the conventional
     /// source set entirely.
     pub sources: Option<Vec<String>>,
-    /// Globs relative to the package root, removed from the source set.
+    /// Globs relative to the project root, removed from the source set.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Header search directories, relative to the package root.
+    /// Header search directories, relative to the project root.
     #[serde(default)]
     pub include_dirs: Vec<PathBuf>,
 }
@@ -88,7 +88,7 @@ pub enum ManifestError {
     #[error("missing required field '{0}'")]
     MissingField(String),
 
-    #[error("invalid 'package.std': {0}")]
+    #[error("invalid 'project.std': {0}")]
     InvalidStd(#[from] ParseCppStdError),
 
     #[error(
@@ -111,21 +111,21 @@ impl Manifest {
     ///
     /// # Errors
     ///
-    /// Fails on invalid TOML, a missing `package.name` or `[[bin]]` `name`, or an
-    /// unknown `package.std`.
+    /// Fails on invalid TOML, a missing `project.name` or `[[bin]]` `name`, or an
+    /// unknown `project.std`.
     pub fn from_toml_str(text: &str) -> Result<Self, ManifestError> {
         let raw: RawManifest = toml::from_str(text)?;
 
-        let package = raw
-            .package
-            .ok_or_else(|| ManifestError::MissingField("package.name".into()))?;
-        let name = package
+        let project = raw
+            .project
+            .ok_or_else(|| ManifestError::MissingField("project.name".into()))?;
+        let name = project
             .name
-            .ok_or_else(|| ManifestError::MissingField("package.name".into()))?;
-        let version = package
+            .ok_or_else(|| ManifestError::MissingField("project.name".into()))?;
+        let version = project
             .version
             .unwrap_or_else(|| DEFAULT_VERSION.to_string());
-        let std = match package.std {
+        let std = match project.std {
             Some(value) => value.parse()?,
             None => CppStd::DEFAULT,
         };
@@ -150,7 +150,7 @@ impl Manifest {
             .collect();
 
         Ok(Self {
-            package: Package { name, version, std },
+            project: Project { name, version, std },
             lib: raw.lib,
             bins: raw.bin,
             dependencies,
@@ -170,7 +170,7 @@ impl Manifest {
         Self::from_toml_str(&text)
     }
 
-    /// Load `Yam.toml` from a package root directory.
+    /// Load `Yam.toml` from a project root directory.
     ///
     /// # Errors
     ///
@@ -189,7 +189,7 @@ impl Manifest {
 
 #[derive(Deserialize)]
 struct RawManifest {
-    package: Option<RawPackage>,
+    project: Option<RawProject>,
     lib: Option<TargetSpec>,
     #[serde(default)]
     bin: Vec<TargetSpec>,
@@ -198,7 +198,7 @@ struct RawManifest {
 }
 
 #[derive(Deserialize)]
-struct RawPackage {
+struct RawProject {
     name: Option<String>,
     version: Option<String>,
     std: Option<String>,
@@ -225,10 +225,10 @@ mod tests {
 
     #[test]
     fn minimal_manifest_gets_defaults() {
-        let manifest = parse("[package]\nname = \"hello\"\n");
+        let manifest = parse("[project]\nname = \"hello\"\n");
         assert_eq!(
-            manifest.package,
-            Package {
+            manifest.project,
+            Project {
                 name: "hello".into(),
                 version: "0.1.0".into(),
                 std: CppStd::Cpp26,
@@ -240,39 +240,39 @@ mod tests {
     }
 
     #[test]
-    fn reads_package_fields() {
-        let manifest = parse("[package]\nname = \"mylib\"\nversion = \"1.2.3\"\nstd = \"c++23\"\n");
-        assert_eq!(manifest.package.version, "1.2.3");
-        assert_eq!(manifest.package.std, CppStd::Cpp23);
+    fn reads_project_fields() {
+        let manifest = parse("[project]\nname = \"mylib\"\nversion = \"1.2.3\"\nstd = \"c++23\"\n");
+        assert_eq!(manifest.project.version, "1.2.3");
+        assert_eq!(manifest.project.std, CppStd::Cpp23);
     }
 
     #[test]
-    fn missing_package_name_is_reported() {
+    fn missing_project_name_is_reported() {
         assert_eq!(
-            parse_err("[package]\nversion = \"1.0.0\"\n"),
-            "missing required field 'package.name'"
+            parse_err("[project]\nversion = \"1.0.0\"\n"),
+            "missing required field 'project.name'"
         );
-        assert_eq!(parse_err(""), "missing required field 'package.name'");
+        assert_eq!(parse_err(""), "missing required field 'project.name'");
     }
 
     #[test]
     fn invalid_std_is_reported() {
         assert_eq!(
-            parse_err("[package]\nname = \"x\"\nstd = \"c++98\"\n"),
-            "invalid 'package.std': invalid std 'c++98'; expected one of: c++11, c++14, \
+            parse_err("[project]\nname = \"x\"\nstd = \"c++98\"\n"),
+            "invalid 'project.std': invalid std 'c++98'; expected one of: c++11, c++14, \
              c++17, c++20, c++23, c++26"
         );
     }
 
     #[test]
     fn invalid_toml_is_a_syntax_error() {
-        let err = Manifest::from_toml_str("[package\nname = 1").unwrap_err();
+        let err = Manifest::from_toml_str("[project\nname = 1").unwrap_err();
         assert!(matches!(err, ManifestError::Syntax(_)), "{err:?}");
     }
 
     #[test]
     fn wrong_field_type_is_a_syntax_error() {
-        let err = Manifest::from_toml_str("[package]\nname = 42\n").unwrap_err();
+        let err = Manifest::from_toml_str("[project]\nname = 42\n").unwrap_err();
         assert!(matches!(err, ManifestError::Syntax(_)), "{err:?}");
     }
 
@@ -280,7 +280,7 @@ mod tests {
     fn reads_lib_and_bin_tables() {
         let manifest = parse(
             r#"
-            [package]
+            [project]
             name = "port"
 
             [lib]
@@ -310,7 +310,7 @@ mod tests {
     fn bin_without_name_is_reported_with_its_index() {
         assert_eq!(
             parse_err(
-                "[package]\nname = \"x\"\n[[bin]]\nname = \"a\"\n[[bin]]\npath = \"b.cpp\"\n"
+                "[project]\nname = \"x\"\n[[bin]]\nname = \"a\"\n[[bin]]\npath = \"b.cpp\"\n"
             ),
             "missing required field 'bin[1].name'"
         );
@@ -320,7 +320,7 @@ mod tests {
     fn reads_dependencies_in_both_forms() {
         let manifest = parse(
             r#"
-            [package]
+            [project]
             name = "app"
 
             [dependencies]
@@ -348,9 +348,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(MANIFEST_FILE_NAME),
-            "[package]\nname = \"x\"\n",
+            "[project]\nname = \"x\"\n",
         )
         .unwrap();
-        assert_eq!(Manifest::load(dir.path()).unwrap().package.name, "x");
+        assert_eq!(Manifest::load(dir.path()).unwrap().project.name, "x");
     }
 }

@@ -3,9 +3,10 @@ use std::str::FromStr;
 
 /// A C++ language standard, as written in `Yam.toml` (`std = "c++26"`).
 ///
-/// In a manifest this is a *minimum*: the lowest standard the package's code and
-/// public interface need. A build compiles its whole dependency graph at the highest
-/// minimum in the graph, so the ordering here matters.
+/// In a manifest this is a *minimum*: the lowest standard the project's own code and
+/// its public interface need. Each project compiles all of its own files at one
+/// standard, `max(own std, declared std of each direct dependency)`, so the ordering
+/// here matters. See `docs/build.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CppStd {
     Cpp11,
