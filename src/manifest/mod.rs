@@ -1,6 +1,7 @@
 //! The `Yam.toml` manifest: its data model, parsing, and target resolution.
 
 mod cpp_std;
+mod render;
 mod sources;
 mod targets;
 mod validate;
@@ -84,6 +85,13 @@ pub enum ManifestError {
 
     #[error("failed to read '{}'", path.display())]
     Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("failed to write '{}'", path.display())]
+    Write {
         path: PathBuf,
         #[source]
         source: io::Error,
