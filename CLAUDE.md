@@ -61,17 +61,32 @@ those pass.
 * **Never link LLVM into `yam`.** Module dependencies come from batched
   `clang-scan-deps -format=p1689`, plus the persistent scan cache. `yam-iface` is a
   separate tool built by `yam-toolchain`.
-* **`std.pcm`/`std.compat.pcm`** are built into the project's build directory and
-  staleness-tracked like any object. They are never cached, shared, bundled, published
+* **`std.pcm`/`std.compat.pcm`** are built into the build directory, one per distinct
+  project standard that uses `import std`, and staleness-tracked like any object. They are never cached, shared, bundled, published
   or fetched outside it (`docs/toolchains.md`, `docs/build.md`).
-* **Manifest semantics.** Targets follow Cargo-style conventions, with
-  `sources`/`exclude` glob overrides for porting existing code. `std` is a *minimum*,
-  and the whole graph builds at `effective_std = max(...)`. `[dependencies]` is parsed
-  but reserved until M4. See roadmap #10.
+* **Manifest semantics.** `Yam.toml` describes a **project** (the `[project]` table).
+  Targets follow Cargo-style conventions, with `sources`/`exclude` glob overrides for
+  porting existing code. `std` is a *minimum* (`c++11` to `c++26`). Each project
+  compiles all of its own files at `max(own std, declared std of each direct
+  dependency)`; there's no whole-graph or per-file standard. `[dependencies]` is
+  parsed but reserved until M4. See roadmap #10 and `docs/build.md`.
+
+### Terminology (strict)
+
+Use the terms in `docs/glossary.md` consistently in code, docs, issues and CLI
+output:
+* **project**: the source tree with a `Yam.toml`; what you build.
+* **target**: a project's library or binary.
+* **package**: the published artifact that `yam publish` produces from a project;
+  what others depend on.
+* **build graph**: the root project plus all of its dependencies.
+
+The crate name `yet-another-make` uses Cargo's sense of "package"; that's unrelated.
 
 ### Design Docs (refer to these strictly)
 
 * `docs/roadmap.md`: the plan of record. Issue `#N` there is GitHub issue `#N`.
+* `docs/glossary.md`: project, target, package, dependency, build graph, workspace.
 * `docs/build.md`: the build engine (scanning, staleness, state file, scheduler,
   performance gates).
 * `docs/release.md`: distribution layouts and the two-tier path resolution (user space

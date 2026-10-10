@@ -2,7 +2,7 @@
 
 ## Overview
 
-`yam build` turns a package's sources into binaries and libraries. It talks to the
+`yam build` turns a project's sources into binaries and libraries. It talks to the
 pinned Clang toolchain directly. There is no CMake or ninja underneath, and no
 intermediate build file. The engine has one headline requirement: **out-perform
 CMake + ninja**, measured rather than claimed (see [Performance gates](#performance-gates)).
@@ -12,6 +12,8 @@ Sections marked **Decided** are settled and implemented against. Sections marked
 issue is implemented, and this doc is updated in the same PR.
 
 Issue numbers (`#N`) refer to [roadmap.md](roadmap.md) and the matching GitHub issues.
+Terms (project, target, package, dependency, build graph) are defined in
+[glossary.md](glossary.md).
 
 ## Where the time goes
 
@@ -44,9 +46,9 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
 2. **Discover sources** by expanding globs. Directory listings and their mtimes are
    kept in the state file, so unchanged directories aren't walked again (#20).
 3. **Locate the toolchain**: `clang++`, `clang-scan-deps` and `std.cppm` (#16).
-4. **Compute `effective_std`** for the build graph (see
-   [One standard per build graph](#one-standard-per-build-graph)).
-5. **Ensure `std.pcm`** (see [std.pcm](#stdpcm)).
+4. **Compute each project's standard** (see
+   [One standard per project](#one-standard-per-project--decided)).
+5. **Ensure a `std.pcm`** for each distinct standard in use (see [std.pcm](#stdpcm--decided)).
 6. **Scan** new and changed files for module provides/requires (#21, #22).
 7. **Build the graph** of module interfaces, objects, `std.pcm` and link steps (#24).
 8. **Decide staleness** for each node (#24).
@@ -72,7 +74,7 @@ process.
   its own internal file cache across files (#21).
 - **The scan cache persists between builds** (#22).
   - Each file's P1689 result is keyed on `blake3(file contents)` plus a hash of the
-    flags that affect scanning (`effective_std`, defines, include dirs, triplet).
+    flags that affect scanning (the project's standard, defines, include dirs, triplet).
   - Only new or changed files are rescanned.
   - **A no-op build performs zero scans.**
 - **Header dependencies come from depfiles.** Each compile runs with `-MD -MF`, and
@@ -86,28 +88,66 @@ process.
   file's top section uses the preprocessor, and a test suite cross-checks it against
   `clang-scan-deps`.
 
-## One standard per build graph — Decided
+## One standard per project — Decided
 
-`std` in `Yam.toml` is a **minimum** (like Cargo's `rust-version`). yam compiles the
-whole graph at `effective_std = max(root std, every dependency's std)`, and prints a
-`note:` naming the dependency that raised it. This is an error only if
-`effective_std` exceeds what the pinned toolchain supports.
+`std` in `Yam.toml` is a **minimum** (like Cargo's `rust-version`): the lowest standard
+the project's own code and its public interface need. Allowed values are `c++11` to
+`c++26`; C++98/03 are not supported.
 
-Clang rejects module interface files built under a different `-std`, and `std.pcm`
-is itself per-`-std`. One standard per graph means one `std.pcm` and one compiled
-interface per module, which is both the compatible choice and the fast one.
+Every file in a project compiles at one standard:
+
+```
+project_std = max(project's own std, declared std of each direct dependency)
+```
+
+- When a dependency raises it, yam prints a `note:` naming the dependency.
+- **Indirect dependencies don't raise it.** A dependency's declared `std` is a promise
+  about its public interface. At publish time `yam-iface` compiles that interface at
+  the declared minimum, which keeps the promise honest. A project that re-exports a
+  C++26 module can't publish with a lower `std`.
+- It's an error only if `project_std` is above what the pinned toolchain supports.
+- Linking projects compiled at different standards is safe: libc++ keeps its ABI
+  stable across `-std` modes, and the package ABI fingerprint (#33) covers everything
+  else.
+
+**Why per project.**
+- **Old code isn't forced onto new standards.** Compiling the whole build graph at
+  its highest `std` would push a C++11 dependency to C++26, and that fails on removed
+  features: `std::auto_ptr`, `throw(X)`, `register`, `bind1st`, `u8` literals and
+  comparison-operator rewrites.
+- **No mixed standards inside one binary.** Per-file standards would let one
+  project's internal headers, inline functions and templates compile differently in
+  different files, which is a silent ODR violation.
+- **The standard changes only when `Yam.toml` does.** Adding one `import` never
+  quietly changes a file's standard.
+- **The module guarantee holds.** A file that imports a module always compiles at or
+  above that module's project standard, which Clang requires when it loads a compiled
+  module interface.
+
+**Examples.**
+
+| Build graph | Standards used |
+|---|---|
+| C++26 app → C++11 header-based library | The library's own files compile at C++11. The app compiles at C++26 and includes the library's headers at C++26. |
+| C++11 app → C++26 module library | The app is raised to C++26, with a `note:` naming the library. |
+| C++26 app → B (C++17) → C (C++11) | The app is at C++26, B at C++17 and C at C++11. Each is raised only by its own direct dependencies. |
+| A C++11 project needs a C++26 module in one file | The whole project is raised. If that's unwanted, split it into two projects. |
 
 ## std.pcm — Decided
 
-`std.pcm`/`std.compat.pcm` are **built locally into the project's build directory,
-and never cached, shared, bundled, published or fetched** outside it (see
+`std.pcm`/`std.compat.pcm` are **built locally into the build directory, and never
+cached, shared, bundled, published or fetched** outside it (see
 [toolchains.md](toolchains.md)).
 
-Within `target/<Profile>/`, `std.pcm` is an **ordinary staleness-tracked artifact**.
-It is rebuilt only when one of these changes:
+A build produces one `std.pcm` for each distinct project standard that uses
+`import std` (C++23 and later). Most builds have exactly one. Each extra one costs
+about 2s, and only once.
+
+Within `target/<Profile>/`, each `std.pcm` is an **ordinary staleness-tracked
+artifact**. It is rebuilt only when one of these changes:
 
 - the identity of the clang binary (path, size, mtime, and its `--version` output)
-- its full compile command, including flags, `effective_std` and target triplet
+- its full compile command, including flags, the standard and the target triplet
 - `std.cppm`
 
 Recompiling it on every invocation would put a ~2s floor under every no-op build and
@@ -172,11 +212,11 @@ target/
 └── <Profile>/                # Debug | Release
     ├── .yam/
     │   └── state             # build state file (#26)
-    ├── std.pcm  std.o        # per build dir, staleness-tracked
-    ├── modules/              # compiled module interfaces (.pcm)
-    ├── obj/                  # object files and depfiles, mirroring source paths
-    ├── <bin>                 # linked executables
-    └── lib<name>.a           # package library
+    ├── std/<std>/            # std.pcm + std.o per standard in use, e.g. std/c++26/
+    ├── modules/<project>/    # compiled module interfaces (.pcm)
+    ├── obj/<project>/        # object files and depfiles, mirroring source paths
+    ├── <bin>                 # the root project's linked executables
+    └── lib<name>.a           # project libraries
 ```
 
 ## Performance gates
