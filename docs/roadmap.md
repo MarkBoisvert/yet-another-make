@@ -177,14 +177,25 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       but **reserved** (no effect) until M4.
     - Error to match: `missing required field 'project.name'`.
 11. **Manifest validation diagnostics** (manifest)
-    - Errors for an empty name or version, an invalid `std` value, or an invalid
-      target name or path.
-    - A glob that matches nothing is a warning.
-    - A file claimed by two targets is an error, unless it's the lib's and the bin
-      links the lib.
-    - A dependency with none of `version`, `path` or `git` is an error.
-    - `rev` without `git` is a warning.
-    - Each diagnostic carries a severity, a key path and a message.
+    - Errors for an empty name or version, or an invalid project or target name (an
+      ASCII letter or `_`, then letters, digits, `-` or `_`; `yam init` shares the
+      rule). An invalid `std` is already rejected at parse time.
+    - **Everything stays inside the project root:** `path`, `sources`/`exclude` globs
+      and `include-dirs` must be relative, with no `..`. Code elsewhere is reached
+      through a path dependency.
+    - A target's entry file must exist and be part of its own source set.
+    - Malformed globs are errors. A user-written glob that matches nothing is a
+      warning; the conventional library globs may legitimately match nothing.
+    - A missing `include-dirs` directory is a warning.
+    - **A file in both the library and a bin is an error.** The bin already links the
+      library, so the file would be compiled and linked twice. Two bins may share a
+      file.
+    - Duplicate `[[bin]]` names are an error.
+    - A dependency with none of `version`, `path` or `git` is an error. `rev` without
+      `git` is a warning.
+    - Unknown manifest keys are warnings (e.g. `unused manifest key 'lib.inlcude-dirs'`).
+    - Each diagnostic carries a severity, a key path, a message and an optional
+      `help:` hint. Validation reports every problem in one run.
 12. **Manifest render + round-trip** (manifest)
     - Rendering then re-parsing gives the same values (property test).
 13. **CLI output helpers: `warning:` / `help:` / `note:`** (cli)
