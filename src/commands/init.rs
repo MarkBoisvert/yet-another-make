@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{InitArgs, Vcs};
+use crate::manifest;
 use crate::style;
 
 const MAIN_TEMPLATE: &str = r#"import std;
@@ -62,7 +63,7 @@ pub fn run(args: &InitArgs) -> Result<()> {
         Some(name) => name.clone(),
         None => package_name_from_path(&path)?,
     };
-    validate_package_name(&name)?;
+    manifest::check_name("project", &name).map_err(anyhow::Error::msg)?;
 
     let is_lib = args.lib;
     // `import std` needs C++23; libs default to the lowest standard that has it so
@@ -125,20 +126,6 @@ fn package_name_from_path(path: &Path) -> Result<String> {
         )
     })?;
     Ok(name.to_string())
-}
-
-fn validate_package_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let first = chars
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("package name cannot be empty"))?;
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        bail!("invalid package name `{name}`: must start with a letter or underscore");
-    }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        bail!("invalid package name `{name}`: must be ASCII alphanumeric, `-`, or `_`");
-    }
-    Ok(())
 }
 
 fn write_manifest(manifest_path: &Path, name: &str, std: &str) -> Result<()> {

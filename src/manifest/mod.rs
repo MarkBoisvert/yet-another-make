@@ -1,7 +1,9 @@
 //! The `Yam.toml` manifest: its data model, parsing, and target resolution.
 
 mod cpp_std;
+mod sources;
 mod targets;
+mod validate;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -10,7 +12,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use cpp_std::{CppStd, ParseCppStdError};
+pub use sources::{GlobError, GlobList, SourceTree};
 pub use targets::{Target, TargetKind, resolve_targets};
+pub use validate::{Diagnostic, Severity, check_name, has_errors, report, validate};
 
 /// The manifest's file name, at the root of every project.
 pub const MANIFEST_FILE_NAME: &str = "Yam.toml";
@@ -30,6 +34,9 @@ pub struct Manifest {
     pub bins: Vec<TargetSpec>,
     /// Parsed but reserved: dependencies have no effect until package support lands.
     pub dependencies: BTreeMap<String, DependencySpec>,
+    /// Keys in the file that yam doesn't recognize, as dotted paths (e.g.
+    /// `lib.inlcude-dirs`). [`validate`] reports them as warnings.
+    pub unused_keys: Vec<String>,
 }
 
 /// The `[project]` table.
@@ -114,7 +121,12 @@ impl Manifest {
     /// Fails on invalid TOML, a missing `project.name` or `[[bin]]` `name`, or an
     /// unknown `project.std`.
     pub fn from_toml_str(text: &str) -> Result<Self, ManifestError> {
-        let raw: RawManifest = toml::from_str(text)?;
+        let mut unused_keys = Vec::new();
+        let raw: RawManifest =
+            serde_ignored::deserialize(toml::Deserializer::parse(text)?, |path| {
+                unused_keys.push(key_path(&path));
+            })?;
+        unused_keys.sort();
 
         let project = raw
             .project
@@ -154,6 +166,7 @@ impl Manifest {
             lib: raw.lib,
             bins: raw.bin,
             dependencies,
+            unused_keys,
         })
     }
 
@@ -184,6 +197,23 @@ impl Manifest {
             });
         }
         Self::from_path(&path)
+    }
+}
+
+/// A `serde_ignored` path as a manifest key: `lib.include-dirs`, `bin[1].name`.
+/// `Option` and newtype layers don't appear in the key.
+fn key_path(path: &serde_ignored::Path<'_>) -> String {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => String::new(),
+        Path::Seq { parent, index } => format!("{}[{index}]", key_path(parent)),
+        Path::Map { parent, key } => match key_path(parent) {
+            prefix if prefix.is_empty() => key.clone(),
+            prefix => format!("{prefix}.{key}"),
+        },
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => key_path(parent),
     }
 }
 
