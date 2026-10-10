@@ -233,10 +233,16 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       hardcoded `/usr/lib/llvm-22`.
     - Missing tools produce a clear, actionable error.
 17. **`yam build`, single-file target (parity)** (engine)
-    - Arguments: `[PATH]`, `--release`, `-v/--verbose` and `--target <NAME>`.
+    - Arguments: `[PATH]`, `--release`, `-v/--verbose`, `--lib` and
+      `--bin <NAME>` (repeatable), as in Cargo. `--target` is reserved for the
+      target triplet, as in Cargo.
     - Builds into `target/Debug` or `target/Release`, with `-O0 -g` or
       `-O3 -DNDEBUG`.
-    - Builds `std.pcm` on every build, per `docs/toolchains.md`.
+    - Builds `std.pcm` and `std.o` per standard (C++23 and later) into
+      `target/<Profile>/std/<std>/`. They're reused while the compiler, the commands
+      and `std.cppm` are unchanged, per `docs/build.md`. Until #24 a stamp file
+      tracks this.
+    - A target with more than one source file is an error until #20.
     - A bin produces an executable; a lib produces a `.a` (via `llvm-ar`, falling
       back to `ar`).
     - Prints `Building <name> v<ver> (<dir>)` and `Finished …`.

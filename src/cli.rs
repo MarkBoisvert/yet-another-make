@@ -82,6 +82,8 @@ impl ColorWhen {
 pub enum Command {
     /// Initialize a new project
     Init(InitArgs),
+    /// Compile the current project
+    Build(BuildArgs),
     /// Remove the target directory
     Clean(CleanArgs),
 }
@@ -111,6 +113,29 @@ pub struct InitArgs {
     /// Initialize a version control repository for the given version control system, overriding auto-detection of an existing repository
     #[arg(long, value_enum, value_name = "VCS")]
     pub vcs: Option<Vcs>,
+}
+
+#[derive(Args)]
+pub struct BuildArgs {
+    /// Path to the project to build
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Build with optimizations, into `target/Release`
+    #[arg(long)]
+    pub release: bool,
+
+    /// Print each command as it runs
+    #[arg(short, long)]
+    pub verbose: bool,
+
+    /// Build only the project's library
+    #[arg(long)]
+    pub lib: bool,
+
+    /// Build only the named binary (repeatable)
+    #[arg(long = "bin", value_name = "NAME")]
+    pub bins: Vec<String>,
 }
 
 #[derive(Args)]
