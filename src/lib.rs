@@ -36,6 +36,7 @@ pub fn run() -> ExitCode {
 
     let result = match command {
         Command::Init(args) => commands::init::run(&args),
+        Command::Clean(args) => commands::clean::run(&args),
     };
 
     match result {
