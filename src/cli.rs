@@ -82,6 +82,8 @@ impl ColorWhen {
 pub enum Command {
     /// Initialize a new project
     Init(InitArgs),
+    /// Remove the target directory
+    Clean(CleanArgs),
 }
 
 #[derive(Args)]
@@ -109,6 +111,25 @@ pub struct InitArgs {
     /// Initialize a version control repository for the given version control system, overriding auto-detection of an existing repository
     #[arg(long, value_enum, value_name = "VCS")]
     pub vcs: Option<Vcs>,
+}
+
+#[derive(Args)]
+pub struct CleanArgs {
+    /// Path to the project to clean
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+
+    /// Only remove release artifacts (`target/Release`)
+    #[arg(long)]
+    pub release: bool,
+
+    /// Show what would be removed without removing anything
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// List every file being removed
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
