@@ -1,0 +1,12 @@
+[package]
+name = "bench"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Benchmark project generator and runner comparing yam against CMake + ninja"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

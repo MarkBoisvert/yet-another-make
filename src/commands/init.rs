@@ -23,12 +23,19 @@ int main() {
 }
 "#;
 
-const LIB_TEMPLATE: &str = r#"int add(int left, int right) {
+const LIB_TEMPLATE: &str = r"int add(int left, int right) {
     return left + right;
 }
-"#;
+";
 
-pub fn run(args: InitArgs) -> Result<()> {
+/// Create a new yam package at `args.path`.
+///
+/// # Errors
+///
+/// Fails if the directory can't be created or resolved, it already holds a
+/// `Yam.toml`, the package name is invalid, or writing the files or initializing
+/// the git repository fails.
+pub fn run(args: &InitArgs) -> Result<()> {
     if args.bin && args.lib {
         bail!("cannot specify both `--bin` and `--lib`");
     }
@@ -232,7 +239,7 @@ mod tests {
     fn fresh_dir_auto_detect_initializes_git() {
         let temp = tempdir().unwrap();
         let target = temp.path().join("app");
-        run(args(target.clone(), None)).unwrap();
+        run(&args(target.clone(), None)).unwrap();
         assert!(has_git(&target));
         assert!(has_gitignore(&target));
     }
@@ -241,7 +248,7 @@ mod tests {
     fn fresh_dir_explicit_vcs_git_initializes_git() {
         let temp = tempdir().unwrap();
         let target = temp.path().join("app");
-        run(args(target.clone(), Some(Vcs::Git))).unwrap();
+        run(&args(target.clone(), Some(Vcs::Git))).unwrap();
         assert!(has_git(&target));
         assert!(has_gitignore(&target));
     }
@@ -250,7 +257,7 @@ mod tests {
     fn fresh_dir_vcs_none_skips_git() {
         let temp = tempdir().unwrap();
         let target = temp.path().join("app");
-        run(args(target.clone(), Some(Vcs::None))).unwrap();
+        run(&args(target.clone(), Some(Vcs::None))).unwrap();
         assert!(!has_git(&target));
         assert!(!has_gitignore(&target));
     }
@@ -260,7 +267,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let parent = existing_repo(temp.path(), "parent");
         let target = parent.join("sub");
-        run(args(target.clone(), None)).unwrap();
+        run(&args(target.clone(), None)).unwrap();
         assert!(!has_git(&target));
         assert!(!has_gitignore(&target));
     }
@@ -270,7 +277,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let parent = existing_repo(temp.path(), "parent");
         let target = parent.join("sub");
-        run(args(target.clone(), Some(Vcs::Git))).unwrap();
+        run(&args(target.clone(), Some(Vcs::Git))).unwrap();
         assert!(has_git(&target));
         assert!(has_gitignore(&target));
     }
@@ -280,7 +287,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let parent = existing_repo(temp.path(), "parent");
         let target = parent.join("sub");
-        run(args(target.clone(), Some(Vcs::None))).unwrap();
+        run(&args(target.clone(), Some(Vcs::None))).unwrap();
         assert!(!has_git(&target));
         assert!(!has_gitignore(&target));
     }
@@ -295,7 +302,7 @@ mod tests {
         let repo_root = existing_repo(temp.path(), "reporoot");
 
         let dotdot_path = repo_root.join("..").join("foo");
-        run(args(dotdot_path, None)).unwrap();
+        run(&args(dotdot_path, None)).unwrap();
 
         let foo = temp.path().join("foo");
         assert!(has_git(&foo));
