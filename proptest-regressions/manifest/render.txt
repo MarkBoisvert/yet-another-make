@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cb8777da1125d23ea7ef29dde2c4793282f81d9d5cc9186cd623778b241ee0c2 # shrinks to manifest = Manifest { project: Project { name: "", version: "", std: Cpp11 }, lib: None, bins: [], dependencies: {"'\"": DependencySpec { version: None, path: None, git: None, rev: None }}, unused_keys: [] }
