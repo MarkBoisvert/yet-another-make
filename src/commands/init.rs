@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,36 +6,64 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::cli::{InitArgs, Vcs};
-use crate::manifest;
+use crate::manifest::{
+    self, CppStd, DEFAULT_VERSION, MANIFEST_FILE_NAME, Manifest, Project, TargetSpec,
+};
 use crate::style;
 
 const MAIN_TEMPLATE: &str = r#"import std;
 
 int main() {
-    std::cout << "Hello, world!" << std::endl;
-    return 0;
+    std::println("Hello, world!");
 }
 "#;
 
-const MAIN_TEMPLATE_LEGACY: &str = r#"#include <iostream>
+const MAIN_TEMPLATE_LEGACY: &str = r#"#include <print>
 
 int main() {
-    std::cout << "Hello, world!" << std::endl;
-    return 0;
+    std::println("Hello, world!");
 }
 "#;
 
-const LIB_TEMPLATE: &str = r"int add(int left, int right) {
+/// `{module}` is the project name as a C++ identifier.
+const LIB_TEMPLATE: &str = r"export module {module};
+
+export namespace {module} {
+
+int add(int left, int right) {
     return left + right;
 }
+
+} // namespace {module}
 ";
 
-/// Create a new yam package at `args.path`.
+/// `{name}` is the project name, `{module}` the same as a C++ identifier.
+const LIB_HEADER_TEMPLATE_LEGACY: &str = r"#pragma once
+
+namespace {module} {
+
+int add(int left, int right);
+
+} // namespace {module}
+";
+
+const LIB_TEMPLATE_LEGACY: &str = r#"#include "{name}.hpp"
+
+namespace {module} {
+
+int add(int left, int right) {
+    return left + right;
+}
+
+} // namespace {module}
+"#;
+
+/// Create a new yam project at `args.path`.
 ///
 /// # Errors
 ///
 /// Fails if the directory can't be created or resolved, it already holds a
-/// `Yam.toml`, the package name is invalid, or writing the files or initializing
+/// `Yam.toml`, the project name is invalid, or writing the files or initializing
 /// the git repository fails.
 pub fn run(args: &InitArgs) -> Result<()> {
     if args.bin && args.lib {
@@ -42,8 +71,7 @@ pub fn run(args: &InitArgs) -> Result<()> {
     }
 
     let path = absolute_path(&args.path)?;
-    fs::create_dir_all(&path)
-        .with_context(|| format!("failed to create directory `{}`", path.display()))?;
+    create_dir(&path)?;
     // Resolve `..`/`.` and symlinks now that the directory exists, so ancestor
     // checks (e.g. detecting an enclosing git repo) walk the real directory tree
     // instead of the literal, possibly relative, path components.
@@ -51,32 +79,53 @@ pub fn run(args: &InitArgs) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to resolve `{}`", path.display()))?;
 
-    let manifest_path = path.join("Yam.toml");
+    let manifest_path = path.join(MANIFEST_FILE_NAME);
     if manifest_path.exists() {
         bail!(
-            "`yam init` cannot be run on existing yam packages\n\n`{}` already exists",
+            "`yam init` cannot be run on existing yam projects\n\n`{}` already exists",
             manifest_path.display()
         );
     }
 
     let name = match &args.name {
         Some(name) => name.clone(),
-        None => package_name_from_path(&path)?,
+        None => project_name_from_path(&path)?,
     };
     manifest::check_name("project", &name).map_err(anyhow::Error::msg)?;
 
     let is_lib = args.lib;
     // `import std` needs C++23; libs default to the lowest standard that has it so
     // the most consumers can use them, bins to the newest.
-    let std = if is_lib { "c++23" } else { "c++26" };
-    write_manifest(&manifest_path, &name, std)?;
+    let std = if is_lib {
+        CppStd::Cpp23
+    } else {
+        CppStd::DEFAULT
+    };
+    // A legacy lib's public header lives in `include/`, which isn't a default
+    // include directory, so it gets a `[lib]` table. Otherwise the Cargo-style
+    // defaults find everything and no target table is written.
+    let lib = (is_lib && args.legacy).then(|| TargetSpec {
+        include_dirs: vec![PathBuf::from("include")],
+        ..TargetSpec::default()
+    });
+    let manifest = Manifest {
+        project: Project {
+            name: name.clone(),
+            version: DEFAULT_VERSION.to_string(),
+            std,
+        },
+        lib,
+        bins: Vec::new(),
+        dependencies: BTreeMap::new(),
+        unused_keys: Vec::new(),
+    };
+    manifest.write(&manifest_path)?;
 
     let src_dir = path.join("src");
-    fs::create_dir_all(&src_dir)
-        .with_context(|| format!("failed to create directory `{}`", src_dir.display()))?;
+    create_dir(&src_dir)?;
 
     if is_lib {
-        write_if_missing(&src_dir.join("lib.cpp"), LIB_TEMPLATE)?;
+        write_lib(&path, &name, args.legacy)?;
     } else {
         let template = if args.legacy {
             MAIN_TEMPLATE_LEGACY
@@ -103,7 +152,7 @@ pub fn run(args: &InitArgs) -> Result<()> {
     } else {
         "binary (application)"
     };
-    style::status("Created", format!("{kind} `{name}` package"));
+    style::status("Created", format!("{kind} `{name}` project"));
 
     Ok(())
 }
@@ -118,22 +167,48 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn package_name_from_path(path: &Path) -> Result<String> {
+fn project_name_from_path(path: &Path) -> Result<String> {
     let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
         anyhow::anyhow!(
-            "cannot infer package name from path `{}`; use --name",
+            "cannot infer project name from path `{}`; use --name",
             path.display()
         )
     })?;
     Ok(name.to_string())
 }
 
-fn write_manifest(manifest_path: &Path, name: &str, std: &str) -> Result<()> {
-    let contents = format!(
-        "[project]\nname = \"{name}\"\nversion = \"0.1.0\"\nstd = \"{std}\"\n\n[dependencies]\n"
-    );
-    fs::write(manifest_path, contents)
-        .with_context(|| format!("failed to write `{}`", manifest_path.display()))
+/// Write the library template, unless the project already has a library entry.
+fn write_lib(root: &Path, name: &str, legacy: bool) -> Result<()> {
+    let src_dir = root.join("src");
+    if src_dir.join("lib.cppm").exists() || src_dir.join("lib.cpp").exists() {
+        return Ok(());
+    }
+    let fill = |template: &str| {
+        template
+            .replace("{name}", name)
+            .replace("{module}", &module_name(name))
+    };
+    if legacy {
+        let include_dir = root.join("include");
+        create_dir(&include_dir)?;
+        write_if_missing(
+            &include_dir.join(format!("{name}.hpp")),
+            &fill(LIB_HEADER_TEMPLATE_LEGACY),
+        )?;
+        write_if_missing(&src_dir.join("lib.cpp"), &fill(LIB_TEMPLATE_LEGACY))
+    } else {
+        write_if_missing(&src_dir.join("lib.cppm"), &fill(LIB_TEMPLATE))
+    }
+}
+
+/// The project name as a C++ module and namespace name: `-` isn't allowed there.
+fn module_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+fn create_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory `{}`", path.display()))
 }
 
 fn write_if_missing(path: &Path, contents: &str) -> Result<()> {
@@ -192,6 +267,7 @@ fn write_gitignore(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::TargetKind;
     use tempfile::tempdir;
 
     fn args(path: PathBuf, vcs: Option<Vcs>) -> InitArgs {
@@ -224,8 +300,6 @@ mod tests {
 
     #[test]
     fn generated_manifests_parse_with_the_manifest_model() {
-        use crate::manifest::{CppStd, Manifest};
-
         let temp = tempdir().unwrap();
         let bin = temp.path().join("app");
         run(&args(bin.clone(), Some(Vcs::None))).unwrap();
@@ -238,6 +312,113 @@ mod tests {
         lib_args.lib = true;
         run(&lib_args).unwrap();
         assert_eq!(Manifest::load(&lib).unwrap().project.std, CppStd::Cpp23);
+    }
+
+    fn init(temp: &Path, name: &str, lib: bool, legacy: bool) -> PathBuf {
+        let dir = temp.join(name);
+        let mut init_args = args(dir.clone(), Some(Vcs::None));
+        init_args.lib = lib;
+        init_args.legacy = legacy;
+        run(&init_args).unwrap();
+        dir
+    }
+
+    fn read(dir: &Path, file: &str) -> String {
+        fs::read_to_string(dir.join(file)).unwrap()
+    }
+
+    /// The generated project validates cleanly and resolves to exactly one target
+    /// with `entry` as its entry file.
+    fn assert_single_target(dir: &Path, kind: TargetKind, entry: &str) {
+        let manifest = Manifest::load(dir).unwrap();
+        let diagnostics = manifest::validate(&manifest, dir).unwrap();
+        assert_eq!(diagnostics, Vec::new());
+        let targets = manifest::resolve_targets(&manifest, dir).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].kind, kind);
+        assert_eq!(targets[0].entry, PathBuf::from(entry));
+    }
+
+    #[test]
+    fn bin_writes_a_default_manifest_and_import_std_main() {
+        let temp = tempdir().unwrap();
+        let dir = init(temp.path(), "app", false, false);
+        assert_eq!(
+            read(&dir, "Yam.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\nstd = \"c++26\"\n\n[dependencies]\n"
+        );
+        let main = read(&dir, "src/main.cpp");
+        assert!(main.starts_with("import std;"), "{main}");
+        assert!(main.contains("std::println"), "{main}");
+        assert_single_target(&dir, TargetKind::Bin, "src/main.cpp");
+    }
+
+    #[test]
+    fn legacy_bin_includes_print() {
+        let temp = tempdir().unwrap();
+        let dir = init(temp.path(), "app", false, true);
+        let main = read(&dir, "src/main.cpp");
+        assert!(main.starts_with("#include <print>"), "{main}");
+        assert!(main.contains("std::println"), "{main}");
+        assert_single_target(&dir, TargetKind::Bin, "src/main.cpp");
+    }
+
+    #[test]
+    fn lib_writes_a_module_interface() {
+        let temp = tempdir().unwrap();
+        let dir = init(temp.path(), "my-lib", true, false);
+        assert_eq!(
+            read(&dir, "Yam.toml"),
+            "[project]\nname = \"my-lib\"\nversion = \"0.1.0\"\nstd = \"c++23\"\n\n[dependencies]\n"
+        );
+        let lib = read(&dir, "src/lib.cppm");
+        assert!(lib.starts_with("export module my_lib;"), "{lib}");
+        assert!(!dir.join("src/lib.cpp").exists());
+        assert!(!dir.join("include").exists());
+        assert_single_target(&dir, TargetKind::Lib, "src/lib.cppm");
+    }
+
+    #[test]
+    fn legacy_lib_writes_a_source_file_and_public_header() {
+        let temp = tempdir().unwrap();
+        let dir = init(temp.path(), "my-lib", true, true);
+        let manifest = Manifest::load(&dir).unwrap();
+        assert_eq!(
+            manifest.lib.unwrap().include_dirs,
+            [PathBuf::from("include")]
+        );
+        let header = read(&dir, "include/my-lib.hpp");
+        assert!(header.starts_with("#pragma once"), "{header}");
+        assert!(header.contains("namespace my_lib {"), "{header}");
+        let lib = read(&dir, "src/lib.cpp");
+        assert!(lib.starts_with("#include \"my-lib.hpp\""), "{lib}");
+        assert!(!dir.join("src/lib.cppm").exists());
+        assert_single_target(&dir, TargetKind::Lib, "src/lib.cpp");
+    }
+
+    #[test]
+    fn existing_sources_are_kept() {
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("port");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/lib.cpp"), "// mine\n").unwrap();
+        let mut init_args = args(dir.clone(), Some(Vcs::None));
+        init_args.lib = true;
+        run(&init_args).unwrap();
+        assert_eq!(read(&dir, "src/lib.cpp"), "// mine\n");
+        assert!(!dir.join("src/lib.cppm").exists());
+    }
+
+    #[test]
+    fn refuses_an_existing_project() {
+        let temp = tempdir().unwrap();
+        let dir = init(temp.path(), "app", false, false);
+        let err = run(&args(dir, Some(Vcs::None))).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be run on existing yam projects"),
+            "{err}"
+        );
     }
 
     #[test]
