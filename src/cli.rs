@@ -86,7 +86,7 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct InitArgs {
-    /// Path to initialize the package in
+    /// Path to initialize the project in
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
@@ -98,7 +98,7 @@ pub struct InitArgs {
     #[arg(long)]
     pub lib: bool,
 
-    /// Set the package name (defaults to the directory name)
+    /// Set the project name (defaults to the directory name)
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 

@@ -22,7 +22,7 @@ modules and only supports them awkwardly.
 
 YAM's goal is to collapse that stack:
 
-- **One manifest** describes your package, its dependencies, and its build
+- **One manifest** describes your project, its dependencies, and its build
   targets — no separate `CMakeLists.txt` and `conanfile.py`.
 - **One command** builds your project, resolving and building dependencies
   as needed.
@@ -38,7 +38,7 @@ YAM's goal is to collapse that stack:
   `cargo add` / `Cargo.lock`.
 - Incremental, parallel builds driven by a dependency graph derived
   directly from your source (including module interfaces).
-- A single `Yam.toml`-style manifest per package.
+- A single `Yam.toml`-style manifest per project.
 - Reproducible builds across compilers and platforms.
 
 None of the above is implemented yet — the repository currently contains
