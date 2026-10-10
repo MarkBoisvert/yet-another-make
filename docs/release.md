@@ -39,11 +39,13 @@ with no explicit "add" command in v1 — see toolchains.md's "Resolved
 decisions."
 
 **No triplet ever ships with precompiled `std.pcm`/`std.compat.pcm`,
-including the host's own.** Those compile locally as an ordinary step of
-every build, every time (~2s, negligible — see
+including the host's own.** Those compile locally as an ordinary build
+artifact inside each project's own build directory (~2s, negligible — see
 `yam-toolchain/docs/targets.md`'s "Measured build costs" and "Implication"
 for why caching them isn't just unnecessary but actively counterproductive
-given how flag-sensitive a `.pcm`'s module interface format is).
+given how flag-sensitive a `.pcm`'s module interface format is). Within a
+build directory, `std.pcm` is staleness-tracked like any object file and
+rebuilt only when its exact inputs change (see [toolchains.md](toolchains.md)).
 
 ```text
 root/
@@ -80,8 +82,8 @@ root/
         │       ├── include/c++/v1/     # Modern LLVM libc++ headers
         │       └── lib/                # Static compilation archives (libc++.a, libc++abi.a, libunwind.a)
         │           # No modules/ dir here — std.pcm/std.compat.pcm are
-        │           # never bundled; always compiled locally, fresh,
-        │           # every build (see toolchains.md)
+        │           # never bundled; always compiled locally into each
+        │           # project's build dir (see toolchains.md)
         ├── aarch64-linux-glibc2.31/    # Curated additional triplet — skeleton only
         │   ├── sysroot/
         │   ├── crt/
@@ -121,9 +123,10 @@ version, since they're compiled from that version's libc++ source —
 `yam toolchain update` must re-resolve/re-fetch (or locally rebuild)
 matching target artifacts for the new toolchain version rather than
 leaving a stale `libc++.a` in place. `std.pcm`/`std.compat.pcm` need no
-such invalidation step — they're never cached to begin with; each build
-recompiles them fresh against whatever toolchain is currently active, so
-there's nothing to go stale (see toolchains.md).
+such invalidation step — they're never cached outside a project's build
+directory, and their staleness key includes the compiler identity, so the
+next build after a toolchain switch rebuilds them automatically (see
+toolchains.md).
 
 #### macOS: Distribution Layout
 

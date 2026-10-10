@@ -62,9 +62,9 @@ vendor a broad default skeleton set into the installer, and at runtime via
 first time a build references a target triplet whose `libcxx/` bundle
 isn't already present — no cached artifact or network access required.
 `std.pcm`/`std.compat.pcm` are a separate, unconditional case: `yam`
-compiles those locally as part of *every* build, for every triplet,
-regardless of whether `libcxx/` came from the base install, a local build,
-or (later) an OCI fetch — see `yam-toolchain/docs/targets.md` for the full
+always compiles those locally, into each project's own build directory, for
+every triplet, regardless of whether `libcxx/` came from the base install, a
+local build, or (later) an OCI fetch — see `yam-toolchain/docs/targets.md` for the full
 design, measured build costs, and why.
 
 ## Platform tiers
@@ -97,15 +97,22 @@ breakdown and rationale). Summary:
   opt-in once single-stage builds are running and the tradeoff can be
   measured for real. See `yam-toolchain/docs/architecture.md`.
 * **`std.pcm`/`std.compat.pcm` are never cached, bundled, or published,
-  anywhere** — always compiled locally as an ordinary step of every
-  build, every time. Measured on real hardware at ~2s to compile from
+  anywhere** — always compiled locally, as an ordinary build artifact in
+  the project's build directory. Measured on real hardware at ~2s to compile from
   scratch (see `yam-toolchain/docs/targets.md`), so there's no build-time
   incentive to cache it; separately, a `.pcm`'s module interface format is
   not stable across Clang versions *or* differing compile flags, so
   precompiling and distributing it centrally would be fragile in ways a
   toolchain-version-and-triple-level cache key can't fully capture.
-  Building it fresh for the exact invocation that needs it sidesteps that
-  class of bug entirely. `libc++.a`/`libc++abi.a`/`libunwind.a` are a
+  Building it fresh for the exact build configuration that needs it
+  sidesteps that class of bug entirely. **"Never cached" means never
+  shared outside the build directory, not "recompiled on every
+  invocation":** within `target/<Profile>/`, `std.pcm` is staleness-tracked
+  like any object file, keyed on the clang binary's identity, the full
+  compile command (flags, effective `std`, triplet) and `std.cppm`, and
+  rebuilt only when one of those changes. Recompiling it on every
+  invocation would put a ~2s floor under no-op builds and break the
+  beat-ninja no-op gate (see [build.md](build.md)). `libc++.a`/`libc++abi.a`/`libunwind.a` are a
   genuinely different case (~20-30s, ordinary ABI stability) and *are*
   worth caching/fetching — that's what the target artifact contains
   instead.
@@ -120,9 +127,9 @@ breakdown and rationale). Summary:
   a possible later optimization (it would slot into the same implicit
   resolution flow, not add a new command) — not required for v1, since the
   local-build cost is already small. `std.pcm`/`std.compat.pcm` are not
-  part of this resolution or this cache at all — they compile fresh as an
-  ordinary step of every build, every time, independent of where `libcxx/`
-  came from.
+  part of this resolution or this cache at all — they are compiled into each
+  project's build directory as ordinary build artifacts, independent of where
+  `libcxx/` came from.
 * **`yam toolchain` command surface**: resolved — `yam` gets
   `yam toolchain install <version>` / `yam toolchain update`, an explicit
   command surface (unlike target resolution above) since switching the
