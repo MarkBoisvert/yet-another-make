@@ -1,0 +1,2 @@
+# Proper nouns clippy would otherwise want in backticks; ".." keeps the defaults.
+doc-valid-idents = ["CMake", ".."]

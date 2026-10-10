@@ -248,15 +248,43 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Prints `Building <name> v<ver> (<dir>)` and `Finished …`.
     - A non-empty `[dependencies]` gives a warning that they're ignored.
 18. **Benchmark project generator** (bench)
-    - `cargo run -p bench -- gen --modules N --fanout F --headers H` emits two
-      equivalent builds of the same project: a `Yam.toml` project and a CMake + ninja
-      project.
-    - Sizes: 100, 1k and 10k modules.
+    - `cargo run -p bench -- gen --style <modules|legacy> --units N --fanout F
+      --seed S <DIR>` writes one source tree containing both a `Yam.toml` and a
+      `CMakeLists.txt`, so yam and CMake + ninja build identical sources.
+    - Two styles over the same seeded dependency graph:
+      - **modules**: a `.cppm` interface plus a `.cpp` implementation unit per
+        module, `import std`, `c++26`.
+      - **legacy**: a `.hpp` + `.cpp` pair per unit, `#include`, `c++17`.
+    - Sizes: 100, 1k and 10k units.
+    - `bench edit <scenario> <DIR>` applies a change (see #19) the same way for both
+      build systems. Repeated edits alternate content, so every run is a real change.
+    - `bench.json` records the chosen leaf, mid and root units and how many units
+      each scenario should rebuild.
+    - `bench configure <DIR>` sets up CMake + ninja with the same compiler and libc++
+      as yam. The modules style needs CMake 4.2 or newer, for
+      `CMAKE_CXX_STDLIB_MODULES_JSON`.
+    - CI smoke test: generate a 10-unit project in each style and build it with CMake
+      + ninja (and with yam once #20 lands). The modules style is built only where
+      CMake is 4.2 or newer.
 19. **Benchmark runner + baseline** (bench, perf)
-    - `hyperfine` scripts for cold, no-op, one-leaf-edit and one-root-interface-edit
-      builds.
-    - Compare against `cmake --build` (ninja) and `ninja` alone.
-    - Record the C++ prototype and CMake + ninja baselines in `docs/bench.md`.
+    - `hyperfine` runs, with `--prepare` applying the edit, comparing `yam build`,
+      `cmake --build` and `ninja` alone. All use the same compiler, flags and `-j`.
+    - Every scenario × both styles × all sizes:
+
+      | Scenario | Change | Expected rebuild |
+      |---|---|---|
+      | `cold` | clean build | everything |
+      | `noop` | nothing (100% build avoidance) | nothing |
+      | `touch` | mtime of the root interface only | nothing for yam (content hash); everything for ninja |
+      | `leaf-impl` | one leaf function body | 1 TU + link |
+      | `leaf-iface` | one leaf interface | the leaf and its importers |
+      | `impl-1pct` / `impl-10pct` | function bodies in 1% / 10% of units | 1% / 10% of TUs |
+      | `mid-iface` | interface of the unit with the median dependent count | about half |
+      | `root-iface` | the interface everything depends on | about all |
+      | `add-unit` | a new leaf unit imported by `main` | 1–2 TUs + link (CMake reconfigures) |
+
+    - Record the CMake + ninja baseline in `docs/bench.md`, along with the machine it
+      ran on. yam's numbers follow once #20 builds multi-file targets.
 
 ## M2 — Build engine (the performance milestone)
 
@@ -308,10 +336,11 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Confirm that mimalloc beats the platform allocator on glibc, macOS and Windows.
       It's enabled on all targets; drop it per target if the data says otherwise.
 28. **Perf gate: beat ninja** (bench, perf)
-    - On 100, 1k and 10k module projects:
-      - no-op `yam build` ≤ `ninja` no-op
-      - leaf edit ≤ `cmake --build`
-      - root edit ≤ `cmake --build`
+    - For every #19 scenario, both styles (modules and legacy) and every size (100,
+      1k, 10k):
+      - `noop` and `touch`: `yam build` ≤ `ninja` alone
+      - every edit scenario: `yam build` ≤ `cmake --build`
+      - `cold`: reported, not gated
     - Results are recorded in `docs/bench.md`. **This is M2's exit criterion.**
 29. **Native fast-path import scanner (spike)** (engine, perf, design)
     - Only if #28 shows scanning matters.

@@ -49,12 +49,12 @@ jobs:
         run: |
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           sudo bash llvm.sh 22
-          sudo apt-get install -y clang-tools-22 libc++-22-dev libc++abi-22-dev
+          sudo apt-get install -y clang-tools-22 libc++-22-dev libc++abi-22-dev ninja-build
           echo /usr/lib/llvm-22/bin >> "$GITHUB_PATH"
       - name: Install Clang 22 (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm@22
+          brew install llvm@22 ninja
           echo "$(brew --prefix llvm@22)/bin" >> "$GITHUB_PATH"
       - name: Install Clang 22 (Windows)
         if: runner.os == 'Windows'
