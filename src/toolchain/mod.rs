@@ -10,6 +10,7 @@
 //! `clang-scan-deps` is looked up the same way (`YAM_CLANG_SCAN_DEPS`), but first next
 //! to the chosen `clang++`, so both come from the same install. `clang++` must be
 //! Clang 22 or newer, and `clang-scan-deps` must have the same major version.
+//! `llvm-ar` is found next to `clang++` too, falling back to `PATH` and then `ar`.
 
 mod std_modules;
 
@@ -40,6 +41,8 @@ const NEWER_MAJORS: u32 = 8;
 pub struct Toolchain {
     pub cxx: Tool,
     pub scan_deps: Tool,
+    /// `llvm-ar`, or `ar` when there's no `llvm-ar`.
+    pub ar: PathBuf,
     pub std_modules: StdModules,
 }
 
@@ -204,10 +207,12 @@ impl Toolchain {
         let search = Search::from_env();
         let cxx = find_cxx(&search, &run_version)?;
         let scan_deps = find_scan_deps(&search, &cxx, &run_version)?;
+        let ar = find_archiver(&search, &cxx)?;
         let std_modules = std_modules::locate(&cxx)?;
         Ok(Self {
             cxx,
             scan_deps,
+            ar,
             std_modules,
         })
     }
@@ -357,33 +362,7 @@ fn find_scan_deps(search: &Search, cxx: &Tool, probe: Probe) -> Result<Tool, Too
         return from_override(SCAN_DEPS_ENV, value, search, &requirement, probe);
     }
 
-    // `clang++-22` pairs with `clang-scan-deps-22`. Look next to both the path as
-    // found and its real location (e.g. `/usr/bin/clang++-22` is a symlink into
-    // `/usr/lib/llvm-22/bin/`).
-    let suffix = cxx
-        .path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .and_then(|stem| stem.strip_prefix("clang++"))
-        .unwrap_or_default();
-    let sibling_names: Vec<String> = [format!("clang-scan-deps{suffix}"), "clang-scan-deps".into()]
-        .iter()
-        .map(|name| exe(name))
-        .collect();
-    let mut sibling_dirs: Vec<PathBuf> = cxx
-        .path
-        .parent()
-        .map(Path::to_path_buf)
-        .into_iter()
-        .collect();
-    if let Some(real) = fs::canonicalize(&cxx.path)
-        .ok()
-        .and_then(|real| real.parent().map(Path::to_path_buf))
-        && !sibling_dirs.contains(&real)
-    {
-        sibling_dirs.push(real);
-    }
-
+    let (sibling_names, sibling_dirs) = siblings(cxx, "clang-scan-deps");
     let names = [
         exe(&format!("clang-scan-deps-{major}")),
         exe("clang-scan-deps"),
@@ -405,6 +384,55 @@ fn find_scan_deps(search: &Search, cxx: &Tool, probe: Probe) -> Result<Tool, Too
             ),
         }
     })
+}
+
+/// Where to look for `tool` next to `cxx`, as names and directories. `clang++-22`
+/// pairs with `<tool>-22`, and both the path as found and its real location are
+/// searched (e.g. `/usr/bin/clang++-22` is a symlink into `/usr/lib/llvm-22/bin/`).
+fn siblings(cxx: &Tool, tool: &str) -> (Vec<String>, Vec<PathBuf>) {
+    let suffix = cxx
+        .path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .and_then(|stem| stem.strip_prefix("clang++"))
+        .unwrap_or_default();
+    let mut names = vec![exe(&format!("{tool}{suffix}"))];
+    if !suffix.is_empty() {
+        names.push(exe(tool));
+    }
+    let mut dirs: Vec<PathBuf> = cxx
+        .path
+        .parent()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect();
+    if let Some(real) = fs::canonicalize(&cxx.path)
+        .ok()
+        .and_then(|real| real.parent().map(Path::to_path_buf))
+        && !dirs.contains(&real)
+    {
+        dirs.push(real);
+    }
+    (names, dirs)
+}
+
+/// The static-library archiver: `llvm-ar` from the same install as `cxx`, else the
+/// bundled or `PATH` `llvm-ar`, else the system `ar`.
+fn find_archiver(search: &Search, cxx: &Tool) -> Result<PathBuf, ToolchainError> {
+    let major = cxx.version.major;
+    let (sibling_names, sibling_dirs) = siblings(cxx, "llvm-ar");
+    let names = [exe(&format!("llvm-ar-{major}")), exe("llvm-ar"), exe("ar")];
+    let bundled: Vec<PathBuf> = search.bundled_dir.iter().cloned().collect();
+    in_dirs(&sibling_names, &sibling_dirs)
+        .chain(in_dirs(&names[1..2], &bundled))
+        .chain(in_dirs(&names, &search.path))
+        .find(|path| path.is_file())
+        .ok_or_else(|| ToolchainError::NotFound {
+            tool: "llvm-ar",
+            wanted: "or `ar`".into(),
+            rejected: Vec::new(),
+            help: format!("install llvm-ar for Clang {major} (on Debian/Ubuntu: llvm-{major})"),
+        })
 }
 
 #[cfg(test)]
@@ -585,6 +613,33 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("clang-tools-22"), "{err}");
+    }
+
+    #[test]
+    fn archiver_prefers_llvm_ar_next_to_clang_then_falls_back_to_ar() {
+        let temp = tempdir().unwrap();
+        let llvm = temp.path().join("llvm");
+        let bin = temp.path().join("bin");
+        let clang = tool(&llvm, "clang++-22", "22.1.8");
+        let cxx = check(&clang, &any_version(), &fake_probe).unwrap();
+        let system_ar = tool(&bin, "ar", "");
+        assert_eq!(find_archiver(&search(&[&bin]), &cxx).unwrap(), system_ar);
+
+        let on_path = tool(&bin, "llvm-ar", "");
+        assert_eq!(find_archiver(&search(&[&bin]), &cxx).unwrap(), on_path);
+
+        let sibling = tool(&llvm, "llvm-ar-22", "");
+        assert_eq!(find_archiver(&search(&[&bin]), &cxx).unwrap(), sibling);
+
+        let empty = tempdir().unwrap();
+        let lone = check(
+            &tool(empty.path(), "clang++", "22.1.8"),
+            &any_version(),
+            &fake_probe,
+        )
+        .unwrap();
+        let err = find_archiver(&search(&[]), &lone).unwrap_err().to_string();
+        assert!(err.contains("llvm-22"), "{err}");
     }
 
     fn any_version() -> Requirement<'static> {
