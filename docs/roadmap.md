@@ -127,10 +127,12 @@ yet-another-make/
      (recommended), `cargo install`, and the opt-in
      `cargo install --target x86_64-unknown-linux-musl yet-another-make`.
 9. **Reconcile `cargo install` with `docs/release.md`** (docs, design)
-   - `cargo install` places `yam` in `~/.cargo/bin`, with no system layout alongside
+   - `cargo install` places `yam` in `~/.cargo/bin`, with no bundled layout alongside
      it.
-   - Define how two-tier path resolution behaves there: skip tier 1 and use
-     `$HOME/.yam` / `%LOCALAPPDATA%`.
+   - Define how two-tier path resolution behaves there. Tier 1 (user space:
+     `$HOME/.yam` / `%LOCALAPPDATA%\YAM`) works as usual. Tier 2 (relative to the
+     binary) finds nothing, so the default toolchain and target must be installed into
+     user space on first use instead of being bundled.
    - Document crates.io as a distribution channel alongside RPM, DEB, Snap, Windows
      and macOS.
 
@@ -299,7 +301,8 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
 31. **Local libc++ build for an uncached target triplet** (toolchain)
     - Happens transparently on first use, per `docs/toolchains.md`.
 32. **Two-tier path resolution** (toolchain)
-    - System layout, then `$HOME/.yam` / `%LOCALAPPDATA%`, per `docs/release.md`.
+    - User space first (`$HOME/.yam` / `%LOCALAPPDATA%\YAM`), then the bundled
+      layout relative to the `yam` binary, per `docs/release.md`.
     - Includes the `cargo install` case from #9.
 
 ## M4 — Packages (epic, `blocked` on design)
