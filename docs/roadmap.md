@@ -283,6 +283,10 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       | `root-iface` | the interface everything depends on | about all |
       | `add-unit` | a new leaf unit imported by `main` | 1–2 TUs + link (CMake reconfigures) |
 
+    - `bench run` saves results after every measurement and resumes where it left
+      off. `bench report` renders them as `docs/bench.md` tables. Heavy scenarios
+      (`cold`, `touch`, `mid-iface`, `root-iface`) at 1k units and above get 2 runs;
+      the rest get 5.
     - Record the CMake + ninja baseline in `docs/bench.md`, along with the machine it
       ran on. yam's numbers follow once #20 builds multi-file targets.
 
