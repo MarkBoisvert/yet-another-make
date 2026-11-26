@@ -1,0 +1,15 @@
+[project]
+name = "tinyxml2"
+version = "11.0.0"
+std = "c++11"
+
+[lib]
+path = "tinyxml2.cpp"
+sources = ["*.cpp"]
+exclude = ["xmltest.cpp"]
+include-dirs = ["."]
+
+[[bin]]
+name = "xmltest"
+path = "xmltest.cpp"
+sources = ["xmltest.cpp"]

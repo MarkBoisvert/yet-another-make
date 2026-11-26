@@ -43,8 +43,9 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
 
 1. **Load the manifest** and resolve the target model (#10): Cargo-style conventions,
    or `[lib]`/`[[bin]]` overrides with `sources`/`exclude` globs.
-2. **Discover sources** by expanding globs. Directory listings and their mtimes are
-   kept in the state file, so unchanged directories aren't walked again (#20).
+2. **Discover sources** by expanding globs over one walk of the project (#20).
+   Directory listings and their mtimes are kept in the state file, so unchanged
+   directories aren't walked again (#26).
 3. **Locate the toolchain**: `clang++`, `clang-scan-deps` and `std.cppm` (#16). Each
    tool comes from an override (`YAM_CXX`, `YAM_CLANG_SCAN_DEPS`), then the bundled
    toolchain, then `PATH`; `clang-scan-deps` is first looked for next to `clang++`.
@@ -52,7 +53,9 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
 4. **Compute each project's standard** (see
    [One standard per project](#one-standard-per-project--decided)).
 5. **Ensure a `std.pcm`** for each distinct standard in use (see [std.pcm](#stdpcm--decided)).
-6. **Scan** new and changed files for module provides/requires (#21, #22).
+6. **Scan** new and changed files for module provides/requires (#21, #22). Until
+   #21, yam reads each file's module declaration and imports from its text and
+   orders a target's interfaces by them (`src/engine/`).
 7. **Build the graph** of module interfaces, objects, `std.pcm` and link steps (#24).
 8. **Decide staleness** for each node (#24).
 9. **Schedule** stale nodes in parallel, in dependency order (#25).
@@ -186,7 +189,7 @@ single read at startup and written at the end of the build.
 - **Path table:** interned paths, so every other table refers to a path by an integer.
 - **Tables:**
   - files: mtime, size and blake3 per path
-  - directory listings: mtime plus the entries, for glob expansion (#20)
+  - directory listings: mtime plus the entries, for glob expansion (#20, #26)
   - scan results: module provides/requires keyed on content and flags hash (#22)
   - header dependencies from depfiles (#23)
   - outputs: the command hash and the input set each output was built from (#24)
@@ -216,11 +219,18 @@ target/
     ├── .yam/
     │   └── state             # build state file (#26)
     ├── std/<std>/            # std.pcm + std.o per standard in use, e.g. std/c++26/
-    ├── modules/<project>/    # compiled module interfaces (.pcm)
-    ├── obj/<project>/        # object files and depfiles, mirroring source paths
+    ├── modules/<project>/    # the library's compiled module interfaces (.pcm)
+    │   └── bin/<bin>/        # a bin's own module interfaces, if it has any
+    ├── obj/<project>/
+    │   ├── lib/              # the library's objects and depfiles, mirroring source paths
+    │   └── bin/<bin>/        # each bin's objects, so bins may share a source file
+    ├── rsp/                  # response files for long archive and link commands
     ├── <bin>                 # the root project's linked executables
     └── lib<name>.a           # project libraries
 ```
+
+Compiled interfaces are named the way Clang's `-fprebuilt-module-path` looks them
+up: `m.pcm` for module `m`, and `m-part.pcm` for its partition `m:part`.
 
 ## Performance gates
 

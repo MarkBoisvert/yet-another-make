@@ -5,7 +5,7 @@
 //! single-line basic strings. Unused keys aren't written back.
 
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{DependencySpec, Manifest, ManifestError, TargetSpec};
 
@@ -63,13 +63,18 @@ fn target(out: &mut String, spec: &TargetSpec) {
     if !spec.exclude.is_empty() {
         list(out, "exclude", spec.exclude.iter().map(String::as_str));
     }
-    if !spec.include_dirs.is_empty() {
-        let dirs: Vec<_> = spec
-            .include_dirs
-            .iter()
-            .map(|d| d.to_string_lossy())
-            .collect();
-        list(out, "include-dirs", dirs.iter().map(AsRef::as_ref));
+    paths(out, "include-dirs", &spec.include_dirs);
+    if !spec.links.is_empty() {
+        list(out, "links", spec.links.iter().map(String::as_str));
+    }
+    paths(out, "link-dirs", &spec.link_dirs);
+}
+
+/// A list of paths, left out when empty.
+fn paths(out: &mut String, name: &str, values: &[PathBuf]) {
+    if !values.is_empty() {
+        let values: Vec<_> = values.iter().map(|p| p.to_string_lossy()).collect();
+        list(out, name, values.iter().map(AsRef::as_ref));
     }
 }
 
@@ -180,12 +185,15 @@ mod tests {
             sources = ["lib/**/*.cpp"]
             exclude = ["lib/test/**"]
             include-dirs = ["include"]
+            link-dirs = ["vendor"]
+            links = ["acme", "pthread"]
         "#;
         let manifest = Manifest::from_toml_str(text).unwrap();
         assert_eq!(
             manifest.to_toml_string(),
             "[project]\nname = \"port\"\nversion = \"1.2.3\"\nstd = \"c++17\"\n\
              \n[lib]\nsources = [\"lib/**/*.cpp\"]\nexclude = [\"lib/test/**\"]\ninclude-dirs = [\"include\"]\n\
+             links = [\"acme\", \"pthread\"]\nlink-dirs = [\"vendor\"]\n\
              \n[[bin]]\nname = \"tool\"\npath = \"tools/tool.cpp\"\n\
              \n[dependencies]\nfmt = \"11.0\"\nlocal = { path = \"../local\" }\n"
         );
@@ -254,14 +262,20 @@ mod tests {
             prop::option::of(texts()),
             texts(),
             texts(),
+            texts(),
+            texts(),
         )
-            .prop_map(|(name, path, sources, exclude, include_dirs)| TargetSpec {
-                name,
-                path: path.map(PathBuf::from),
-                sources,
-                exclude,
-                include_dirs: include_dirs.into_iter().map(PathBuf::from).collect(),
-            })
+            .prop_map(
+                |(name, path, sources, exclude, include_dirs, links, link_dirs)| TargetSpec {
+                    name,
+                    path: path.map(PathBuf::from),
+                    sources,
+                    exclude,
+                    include_dirs: include_dirs.into_iter().map(PathBuf::from).collect(),
+                    links,
+                    link_dirs: link_dirs.into_iter().map(PathBuf::from).collect(),
+                },
+            )
     }
 
     fn dependency_spec() -> impl Strategy<Value = DependencySpec> {

@@ -264,7 +264,7 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       as yam. The modules style needs CMake 4.2 or newer, for
       `CMAKE_CXX_STDLIB_MODULES_JSON`.
     - CI smoke test: generate a 10-unit project in each style and build it with CMake
-      + ninja (and with yam once #20 lands). The modules style is built only where
+      + ninja, and with yam (from #20). The modules style is built only where
       CMake is 4.2 or newer.
 19. **Benchmark runner + baseline** (bench, perf)
     - `hyperfine` runs, with `--prepare` applying the edit, comparing `yam build`,
@@ -298,13 +298,21 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       - `sources`/`exclude` globs
       - `include-dirs`
       - bins linking the project's lib
-    - Compile each project at its project standard (#10), including local-project
-      dependencies built from source.
+    - Compile the project at its project standard (#10). Building `path`
+      dependencies from source moves to M4 with the rest of `[dependencies]`, which
+      stays reserved until then.
     - Add `links` and `link-dirs` on `[lib]`/`[[bin]]`, for system and vendor
       (closed-source) libraries, e.g. `pthread`, `z` or a vendor `.a`. This is a
       manual escape hatch until M4 packages exist.
-    - Expand globs with `globset` and a directory walk. Cache directory listings and
-      mtimes in the state file (#26), so no-op builds don't re-walk unchanged trees.
+      - A `links` entry is a library name (`-lpthread`) or the path of a library
+        file inside the project. `link-dirs` stays inside the project, like
+        `include-dirs`.
+      - A bin that links the project library also links the library's `links`.
+    - Expand globs with `globset` and one directory walk per build, shared with
+      validation. Caching the listings moves to the state file (#26).
+    - Order each target's module interfaces by their imports, read from the files'
+      text. This is a stopgap until #21; every file is compiled on every build until
+      #24, one at a time until #25.
     - Two `main()` entry files in one bin is a clear error.
     - **Porting acceptance test:** an existing open-source, header-based C++ library
       plus its CLI builds from a `Yam.toml` that uses only `sources`, `exclude`,
@@ -333,6 +341,8 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
 26. **Binary build state file** (engine, perf)
     - One compact file, loaded with a single read at startup.
     - Versioned header; a corrupt file triggers a rebuild, not a crash.
+    - Caches directory listings and their mtimes for glob expansion (from #20), so
+      no-op builds don't re-walk unchanged trees.
 27. **Startup & stat hot-path profiling** (perf)
     - Profile no-op builds with `perf` and `cargo flamegraph`.
     - Remove allocations from the per-file check loop; parallelize `stat` calls if it

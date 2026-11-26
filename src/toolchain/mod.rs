@@ -113,9 +113,7 @@ impl Search {
                 .ok()
                 .map(|exe| fs::canonicalize(&exe).unwrap_or(exe))
                 .and_then(|exe| bundled_dir(&exe)),
-            path: var("PATH")
-                .map(|path| env::split_paths(&path).collect())
-                .unwrap_or_default(),
+            path: var("PATH").map_or_default(|path| env::split_paths(&path).collect()),
         }
     }
 }

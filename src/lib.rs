@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod commands;
+pub mod engine;
 pub mod manifest;
 pub mod style;
 pub mod toolchain;
@@ -17,7 +18,6 @@ use cli::{Cli, ColorWhen, Command};
 ///
 /// Argument errors, `--help` and `--version` are handled by clap, which exits the
 /// process directly.
-#[must_use]
 pub fn run() -> ExitCode {
     // `--color` needs to be known before the rest of argument parsing runs, so that
     // parse errors and `--help`/`--version` themselves come out correctly colored.
