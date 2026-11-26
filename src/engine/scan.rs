@@ -1,401 +1,326 @@
-//! A textual reader for the module declarations and imports at the top of a C++
-//! source file, and for a `main()` definition.
+//! Module dependencies from one batched `clang-scan-deps -format=p1689` call.
 //!
-//! This is a stopgap until batched `clang-scan-deps -format=p1689` (#21) reports
-//! provides and requires. It skips comments, string literals and preprocessor
-//! directives, then reads the file's preamble: `module;`, `export module m;`,
-//! `module m;`, `module m:part;` and `export import`/`import` declarations, stopping
-//! at the first other declaration. It doesn't evaluate `#if`, so a module declaration
-//! inside a conditional is read as if the condition held.
+//! Every file to scan becomes one entry in a generated compilation database, with the
+//! same flags its compile uses and its object file as the entry's `output`. One
+//! `clang-scan-deps` run scans them all, in parallel, and reports each file's
+//! P1689 rule: the module it provides, if any, and the modules it requires. Rules
+//! are matched back to files by their `primary-output`, which is the entry's
+//! `output`; without that field `clang-scan-deps` leaves it empty.
+//!
+//! Each file is scanned on every build until the persistent scan cache (#22).
 
-/// What a source file declares and imports.
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+
+use serde::{Deserialize, Serialize};
+
+/// A file to scan, with the compile command it would be built with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanJob {
+    /// The source file, absolute.
+    pub source: PathBuf,
+    /// Its object file, absolute. Unique per job, since it identifies the result.
+    pub output: PathBuf,
+    /// The full compile command, compiler first.
+    pub arguments: Vec<OsString>,
+}
+
+/// What a file provides and requires.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Scan {
-    pub module: Option<ModuleDecl>,
-    /// Imports in order. Partition imports (`import :p;`) are already qualified with
-    /// the file's own module name, as `m:p`.
-    pub imports: Vec<Import>,
-    /// Whether the file seems to define `main()`.
-    pub defines_main: bool,
-}
-
-/// A file's module declaration.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ModuleDecl {
-    /// `export module m;` or `export module m:part;`: an interface unit.
-    Interface(String),
-    /// `module m:part;`: an internal partition, which other units of `m` import.
-    Partition(String),
-    /// `module m;`: an implementation unit, which implicitly imports `m`.
-    Implementation(String),
-}
-
-impl ModuleDecl {
-    /// The module this file belongs to, without any partition: `m` for `m:part`.
-    #[must_use]
-    pub fn primary(&self) -> &str {
-        let (Self::Interface(name) | Self::Partition(name) | Self::Implementation(name)) = self;
-        name.split(':').next().unwrap_or_default()
-    }
-
-    /// The module or partition this file provides, if any.
-    #[must_use]
-    pub fn provides(&self) -> Option<&str> {
-        match self {
-            Self::Interface(name) | Self::Partition(name) => Some(name),
-            Self::Implementation(_) => None,
-        }
-    }
+pub struct Deps {
+    /// The module or partition the file provides (`m`, `m:part`), if any.
+    pub provides: Option<Provided>,
+    /// The modules and partitions it imports, partitions qualified as `m:part`. An
+    /// implementation unit (`module m;`) requires `m`.
+    pub requires: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Import {
-    /// `import m;`, `import m:p;` or (qualified) `import :p;`.
-    Module(String),
-    /// `import <header>;` or `import "header";`.
-    HeaderUnit,
+pub struct Provided {
+    pub name: String,
+    /// `false` for an internal partition (`module m:part;`).
+    pub is_interface: bool,
 }
 
-impl Scan {
-    /// Read `source`, a file's text.
-    #[must_use]
-    pub fn of(source: &str) -> Self {
-        let code = strip(source);
-        let tokens = tokenize(&code);
-        let mut scan = Self {
-            defines_main: defines_main(&tokens),
-            ..Self::default()
-        };
-        scan.read_preamble(&tokens);
-        scan
+#[derive(Debug, thiserror::Error)]
+pub enum ScanError {
+    #[error("failed to write `{}`", path.display())]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("couldn't run `{}`", program.display())]
+    Spawn {
+        program: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("could not scan the project's module dependencies ({status})")]
+    Failed { status: ExitStatus },
+
+    #[error("couldn't read `clang-scan-deps` output: {0}")]
+    Parse(#[from] serde_json::Error),
+
+    #[error("`clang-scan-deps` reported nothing for `{}`", file.display())]
+    Missing { file: PathBuf },
+}
+
+/// Scan `jobs` with the `clang-scan-deps` at `program`, writing the compilation
+/// database to `database`. Returns each job's dependencies, in job order. The
+/// scanner's diagnostics go straight to the terminal.
+///
+/// # Errors
+///
+/// Fails if the database can't be written, `clang-scan-deps` can't be run or fails
+/// (for example on a syntax error in a module declaration, or a header-unit
+/// import), or its output doesn't cover every job.
+pub fn scan(
+    program: &Path,
+    database: &Path,
+    jobs: &[ScanJob],
+    verbose: bool,
+) -> Result<Vec<Deps>, ScanError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let write_error = |source| ScanError::Write {
+        path: database.to_path_buf(),
+        source,
+    };
+    if let Some(dir) = database.parent() {
+        fs::create_dir_all(dir).map_err(write_error)?;
+    }
+    fs::write(database, compilation_database(jobs)).map_err(write_error)?;
+
+    let mut command = Command::new(program);
+    command
+        .arg("-format=p1689")
+        .arg(format!("-compilation-database={}", database.display()))
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit());
+    if verbose {
+        crate::style::status(
+            "Running",
+            format!(
+                "`{} -format=p1689 -compilation-database={}`",
+                program.display(),
+                database.display()
+            ),
+        );
+    }
+    let output = command.output().map_err(|source| ScanError::Spawn {
+        program: program.to_path_buf(),
+        source,
+    })?;
+    if !output.status.success() {
+        return Err(ScanError::Failed {
+            status: output.status,
+        });
+    }
+    match_rules(jobs, parse(&output.stdout)?)
+}
+
+/// The compilation database for `jobs`, as JSON.
+#[must_use]
+pub fn compilation_database(jobs: &[ScanJob]) -> String {
+    #[derive(Serialize)]
+    struct Entry {
+        directory: String,
+        file: String,
+        output: String,
+        arguments: Vec<String>,
+    }
+    let entries: Vec<Entry> = jobs
+        .iter()
+        .map(|job| Entry {
+            directory: job
+                .source
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_string_lossy()
+                .into_owned(),
+            file: job.source.to_string_lossy().into_owned(),
+            output: job.output.to_string_lossy().into_owned(),
+            arguments: job
+                .arguments
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
+        })
+        .collect();
+    serde_json::to_string_pretty(&entries).unwrap_or_default()
+}
+
+/// P1689 rules keyed by their `primary-output`.
+fn parse(json: &[u8]) -> Result<HashMap<String, Deps>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        rules: Vec<Rule>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Rule {
+        #[serde(default)]
+        primary_output: String,
+        #[serde(default)]
+        provides: Vec<Provide>,
+        #[serde(default)]
+        requires: Vec<Require>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Provide {
+        logical_name: String,
+        #[serde(default = "interface_by_default")]
+        is_interface: bool,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct Require {
+        logical_name: String,
+    }
+    fn interface_by_default() -> bool {
+        true
     }
 
-    fn read_preamble(&mut self, tokens: &[&str]) {
-        let mut rest = tokens;
-        loop {
-            let (exported, statement) = match rest {
-                ["export", tail @ ..] => (true, tail),
-                tail => (false, tail),
+    let file: File = serde_json::from_slice(json)?;
+    Ok(file
+        .rules
+        .into_iter()
+        .map(|rule| {
+            let deps = Deps {
+                provides: rule.provides.into_iter().next().map(|p| Provided {
+                    name: p.logical_name,
+                    is_interface: p.is_interface,
+                }),
+                requires: rule.requires.into_iter().map(|r| r.logical_name).collect(),
             };
-            match statement {
-                ["module", ";", tail @ ..] if !exported => rest = tail,
-                ["module", tail @ ..] => {
-                    let Some((name, tail)) = module_name(tail) else {
-                        return;
-                    };
-                    let Some(tail) = tail.strip_prefix(&[";"]) else {
-                        return;
-                    };
-                    self.module = Some(match (exported, name.contains(':')) {
-                        (true, _) => ModuleDecl::Interface(name),
-                        (false, true) => ModuleDecl::Partition(name),
-                        (false, false) => ModuleDecl::Implementation(name),
-                    });
-                    rest = tail;
-                }
-                ["import", tail @ ..] => {
-                    let Some((import, tail)) = self.import(tail) else {
-                        return;
-                    };
-                    self.imports.push(import);
-                    rest = tail;
-                }
-                _ => return,
-            }
-        }
-    }
-
-    /// The import after an `import` keyword, and the tokens after its `;`.
-    fn import<'t>(&self, tokens: &'t [&'t str]) -> Option<(Import, &'t [&'t str])> {
-        let (import, tail) = match tokens {
-            ["<" | "\"", ..] => {
-                let end = tokens.iter().position(|t| *t == ";")?;
-                return Some((Import::HeaderUnit, &tokens[end + 1..]));
-            }
-            [":", tail @ ..] => {
-                let (partition, tail) = dotted(tail)?;
-                let primary = self.module.as_ref().map_or("", ModuleDecl::primary);
-                (Import::Module(format!("{primary}:{partition}")), tail)
-            }
-            tail => {
-                let (name, tail) = module_name(tail)?;
-                (Import::Module(name), tail)
-            }
-        };
-        Some((import, tail.strip_prefix(&[";"])?))
-    }
+            (normalize(&rule.primary_output), deps)
+        })
+        .collect())
 }
 
-/// `a.b` or `a.b:c.d`, and the tokens after it.
-fn module_name<'t>(tokens: &'t [&'t str]) -> Option<(String, &'t [&'t str])> {
-    let (mut name, tail) = dotted(tokens)?;
-    if let [":", after @ ..] = tail {
-        let (partition, tail) = dotted(after)?;
-        name.push(':');
-        name.push_str(&partition);
-        return Some((name, tail));
-    }
-    Some((name, tail))
+/// Each job's rule, in job order.
+fn match_rules(jobs: &[ScanJob], mut rules: HashMap<String, Deps>) -> Result<Vec<Deps>, ScanError> {
+    jobs.iter()
+        .map(|job| {
+            rules
+                .remove(&normalize(&job.output.to_string_lossy()))
+                .ok_or_else(|| ScanError::Missing {
+                    file: job.source.clone(),
+                })
+        })
+        .collect()
 }
 
-/// Identifiers joined by `.`, and the tokens after them.
-fn dotted<'t>(tokens: &'t [&'t str]) -> Option<(String, &'t [&'t str])> {
-    let (first, mut tail) = tokens.split_first()?;
-    if !is_identifier(first) {
-        return None;
-    }
-    let mut name = (*first).to_string();
-    while let [".", part, after @ ..] = tail
-        && is_identifier(part)
-    {
-        name.push('.');
-        name.push_str(part);
-        tail = after;
-    }
-    Some((name, tail))
-}
-
-fn is_identifier(token: &str) -> bool {
-    token
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_alphabetic() || c == '_')
-}
-
-/// `int main(` or `auto main(`, not as a member (`x.main(`, `X::main(`).
-fn defines_main(tokens: &[&str]) -> bool {
-    tokens.windows(3).enumerate().any(|(i, window)| {
-        matches!(window, ["int" | "auto", "main", "("])
-            && !(i > 0 && matches!(tokens[i - 1], "." | "->" | ":"))
-    })
-}
-
-/// Identifiers and numbers as tokens; every other non-space character is a token of
-/// its own. `::` comes out as two `:` tokens, which is all the preamble needs.
-fn tokenize(code: &str) -> Vec<&str> {
-    let mut tokens = Vec::new();
-    let mut chars = code.char_indices().peekable();
-    while let Some((start, c)) = chars.next() {
-        if c.is_whitespace() {
-            continue;
-        }
-        let mut end = start + c.len_utf8();
-        if c.is_alphanumeric() || c == '_' {
-            while let Some(&(i, next)) = chars.peek() {
-                if !(next.is_alphanumeric() || next == '_') {
-                    break;
-                }
-                end = i + next.len_utf8();
-                chars.next();
-            }
-        }
-        tokens.push(&code[start..end]);
-    }
-    tokens
-}
-
-/// `source` with comments and preprocessor directives blanked out, and each string
-/// or character literal replaced by its opening quote. Newlines are kept.
-fn strip(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
-    let mut line_start = true;
-    while let Some(c) = chars.next() {
-        match c {
-            '\n' => {
-                out.push('\n');
-                line_start = true;
-                continue;
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                skip_line(&mut chars, &mut out, false);
-                line_start = true;
-                continue;
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut last = ' ';
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        out.push('\n');
-                    }
-                    if last == '*' && c == '/' {
-                        break;
-                    }
-                    last = c;
-                }
-                out.push(' ');
-                continue;
-            }
-            '#' if line_start => {
-                skip_line(&mut chars, &mut out, true);
-                line_start = true;
-                continue;
-            }
-            '"' if out.ends_with('R') => {
-                skip_raw_string(&mut chars);
-                out.push('"');
-            }
-            '"' | '\'' => {
-                let mut escaped = false;
-                for next in chars.by_ref() {
-                    if next == '\n' {
-                        break;
-                    }
-                    if !escaped && next == c {
-                        break;
-                    }
-                    escaped = !escaped && next == '\\';
-                }
-                out.push(c);
-            }
-            c => out.push(c),
-        }
-        if !c.is_whitespace() {
-            line_start = false;
-        }
-    }
-    out
-}
-
-/// Skip to the end of the line, following `\` continuations when `continued` is set
-/// (preprocessor directives). The newline itself is written to `out`.
-fn skip_line(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    out: &mut String,
-    continued: bool,
-) {
-    let mut last = ' ';
-    for c in chars.by_ref() {
-        if c == '\n' {
-            out.push('\n');
-            if !(continued && last == '\\') {
-                return;
-            }
-        }
-        if c != '\r' {
-            last = c;
-        }
-    }
-}
-
-/// Skip a raw string's body, `delim( … )delim"`, after its opening quote.
-fn skip_raw_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    let mut delimiter = String::new();
-    for c in chars.by_ref() {
-        if c == '(' {
-            break;
-        }
-        delimiter.push(c);
-    }
-    let close: Vec<char> = format!("){delimiter}\"").chars().collect();
-    let mut window: Vec<char> = Vec::with_capacity(close.len());
-    for c in chars.by_ref() {
-        if window.len() == close.len() {
-            window.remove(0);
-        }
-        window.push(c);
-        if window == close {
-            return;
-        }
-    }
+/// A path as a lookup key, so `\` and `/` separators compare equal.
+fn normalize(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn imports(scan: &Scan) -> Vec<&str> {
-        scan.imports
-            .iter()
-            .map(|import| match import {
-                Import::Module(name) => name.as_str(),
-                Import::HeaderUnit => "<header>",
-            })
-            .collect()
+    fn job(source: &str, output: &str) -> ScanJob {
+        ScanJob {
+            source: PathBuf::from(source),
+            output: PathBuf::from(output),
+            arguments: vec!["clang++".into(), "-std=c++26".into(), "-c".into()],
+        }
     }
 
     #[test]
-    fn reads_an_interface_and_its_imports() {
-        let scan = Scan::of(
-            "export module u0005;\n\nimport std;\nimport u0004;\nexport import a.b:c;\n\nexport namespace u0005 {}\nimport late;\n",
-        );
-        assert_eq!(scan.module, Some(ModuleDecl::Interface("u0005".into())));
-        assert_eq!(imports(&scan), ["std", "u0004", "a.b:c"]);
-        assert!(!scan.defines_main);
-    }
-
-    #[test]
-    fn reads_the_global_module_fragment_and_implementation_units() {
-        let scan = Scan::of(
-            "module;\n#include <cstdio>\n#define X \\\n  import nope;\nmodule app.core;\nimport :util;\n",
-        );
+    fn writes_one_database_entry_per_job() {
+        let db = compilation_database(&[job("/p/src/a.cppm", "/p/out/a.cppm.o")]);
+        let entries: serde_json::Value = serde_json::from_str(&db).unwrap();
         assert_eq!(
-            scan.module,
-            Some(ModuleDecl::Implementation("app.core".into()))
+            entries,
+            serde_json::json!([{
+                "directory": "/p/src",
+                "file": "/p/src/a.cppm",
+                "output": "/p/out/a.cppm.o",
+                "arguments": ["clang++", "-std=c++26", "-c"],
+            }])
         );
-        assert_eq!(imports(&scan), ["app.core:util"]);
     }
 
-    #[test]
-    fn reads_partitions() {
-        let scan = Scan::of("module m:detail;\nimport :other;\n");
-        assert_eq!(scan.module, Some(ModuleDecl::Partition("m:detail".into())));
-        assert_eq!(imports(&scan), ["m:other"]);
-        let scan = Scan::of("export module m:api;\n");
-        assert_eq!(scan.module, Some(ModuleDecl::Interface("m:api".into())));
-    }
+    /// Output in the shape `clang-scan-deps` 23 prints, rules in completion order.
+    const OUTPUT: &str = r#"{
+      "revision": 0,
+      "rules": [
+        { "primary-output": "/p/out/main.cpp.o",
+          "requires": [ { "logical-name": "std" }, { "logical-name": "b", "source-path": "/p/b.cpp" } ] },
+        { "primary-output": "/p/out/detail.cpp.o",
+          "provides": [ { "is-interface": false, "logical-name": "a:detail", "source-path": "/p/detail.cpp" } ] },
+        { "primary-output": "/p/out/a.cppm.o",
+          "provides": [ { "is-interface": true, "logical-name": "a", "source-path": "/p/a.cppm" } ],
+          "requires": [ { "logical-name": "a:part", "source-path": "/p/a-part.cppm" } ] },
+        { "primary-output": "/p/out/plain.cpp.o" }
+      ],
+      "version": 1
+    }"#;
 
     #[test]
-    fn ignores_comments_strings_and_directives() {
-        let scan = Scan::of(
-            "// export module fake;\n/* module\n other; */\n#include \"x.h\" // import y;\nimport std;\nauto s = \"import z;\";\n",
-        );
-        assert_eq!(scan.module, None);
-        assert_eq!(imports(&scan), ["std"]);
-    }
-
-    #[test]
-    fn legacy_files_have_no_module_declarations() {
-        let scan = Scan::of(
-            "#include <cstdio>\n#include \"lib.hpp\"\n\nint main(int argc, char** argv) {\n  std::printf(\"hi\");\n}\n",
-        );
+    fn matches_rules_to_jobs_by_their_output() {
+        let jobs = [
+            job("/p/a.cppm", "/p/out/a.cppm.o"),
+            job("/p/detail.cpp", "/p/out/detail.cpp.o"),
+            job("/p/main.cpp", "/p/out/main.cpp.o"),
+            job("/p/plain.cpp", "/p/out/plain.cpp.o"),
+        ];
+        let deps = match_rules(&jobs, parse(OUTPUT.as_bytes()).unwrap()).unwrap();
         assert_eq!(
-            scan,
-            Scan {
-                module: None,
-                imports: vec![],
-                defines_main: true,
-            }
+            deps,
+            [
+                Deps {
+                    provides: Some(Provided {
+                        name: "a".into(),
+                        is_interface: true
+                    }),
+                    requires: vec!["a:part".into()],
+                },
+                Deps {
+                    provides: Some(Provided {
+                        name: "a:detail".into(),
+                        is_interface: false
+                    }),
+                    requires: vec![],
+                },
+                Deps {
+                    provides: None,
+                    requires: vec!["std".into(), "b".into()],
+                },
+                Deps::default(),
+            ]
         );
     }
 
     #[test]
-    fn header_units_are_reported() {
-        let scan = Scan::of("import <vector>;\nimport \"config.h\";\nimport std;\n");
-        assert_eq!(imports(&scan), ["<header>", "<header>", "std"]);
+    fn a_job_without_a_rule_is_an_error() {
+        let jobs = [job("/p/gone.cpp", "/p/out/gone.cpp.o")];
+        let err = match_rules(&jobs, parse(OUTPUT.as_bytes()).unwrap()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "`clang-scan-deps` reported nothing for `/p/gone.cpp`"
+        );
     }
 
     #[test]
-    fn import_as_an_ordinary_identifier_ends_the_preamble() {
-        let scan = Scan::of("void import(int);\nimport std;\n");
-        assert_eq!(imports(&scan), Vec::<&str>::new());
-    }
-
-    #[test]
-    fn finds_main_but_not_members_or_strings() {
-        assert!(Scan::of("int main() {}").defines_main);
-        assert!(Scan::of("auto main() -> int { return 0; }").defines_main);
-        assert!(!Scan::of("int x = app.main();").defines_main);
-        assert!(!Scan::of("int App::main(int) { return 0; }").defines_main);
-        assert!(!Scan::of("const char* s = \"int main(\";").defines_main);
-        assert!(!Scan::of("// int main() {}\n/* int main() */").defines_main);
-        assert!(!Scan::of("int domain(int);").defines_main);
-    }
-
-    #[test]
-    fn raw_strings_are_skipped() {
-        let scan = Scan::of("auto s = R\"x(int main() { \")\" }\n)x\";\n");
-        assert!(!scan.defines_main);
+    fn windows_separators_match() {
+        let json = r#"{ "rules": [ { "primary-output": "C:\\p\\out\\a.cpp.o" } ] }"#;
+        let jobs = [job("C:/p/a.cpp", "C:/p/out/a.cpp.o")];
+        assert_eq!(
+            match_rules(&jobs, parse(json.as_bytes()).unwrap()).unwrap(),
+            [Deps::default()]
+        );
     }
 }
