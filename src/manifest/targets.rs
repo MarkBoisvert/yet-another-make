@@ -38,6 +38,10 @@ pub struct Target {
     pub sources: Vec<String>,
     pub exclude: Vec<String>,
     pub include_dirs: Vec<PathBuf>,
+    /// Library names or project-relative library files to link (`links`).
+    pub links: Vec<String>,
+    /// Library search directories, relative to the project root (`link-dirs`).
+    pub link_dirs: Vec<PathBuf>,
     /// For binaries: whether the project library is linked in.
     pub links_lib: bool,
 }
@@ -122,6 +126,8 @@ fn resolve_lib(spec: Option<&TargetSpec>, project_name: &str, root: &Path) -> Op
         sources,
         exclude,
         include_dirs: spec.include_dirs,
+        links: spec.links,
+        link_dirs: spec.link_dirs,
         links_lib: false,
     })
 }
@@ -139,6 +145,8 @@ fn bin_target(name: String, spec: &TargetSpec, default_entry: PathBuf, links_lib
         sources,
         exclude: spec.exclude.clone(),
         include_dirs: spec.include_dirs.clone(),
+        links: spec.links.clone(),
+        link_dirs: spec.link_dirs.clone(),
         links_lib,
     }
 }
@@ -233,6 +241,8 @@ mod tests {
                 sources: vec!["src/main.cpp".into()],
                 exclude: vec![],
                 include_dirs: vec![],
+                links: vec![],
+                link_dirs: vec![],
                 links_lib: false,
             }]
         );
@@ -250,6 +260,8 @@ mod tests {
                 sources: vec!["src/**/*.cppm".into(), "src/**/*.cpp".into()],
                 exclude: vec!["src/main.cpp".into(), "src/bin/**".into()],
                 include_dirs: vec![],
+                links: vec![],
+                link_dirs: vec![],
                 links_lib: false,
             }]
         );
@@ -331,10 +343,14 @@ mod tests {
     #[test]
     fn lib_sources_replace_the_convention_and_keep_only_user_excludes() {
         let targets = resolve(
-            "[lib]\npath = \"lib/core.cpp\"\nsources = [\"lib/**/*.cpp\"]\nexclude = [\"lib/test/**\"]\ninclude-dirs = [\"include\"]\n",
+            "[lib]\npath = \"lib/core.cpp\"\nsources = [\"lib/**/*.cpp\"]\nexclude = [\"lib/test/**\"]\ninclude-dirs = [\"include\"]\nlinks = [\"z\"]\nlink-dirs = [\"vendor\"]\n\n[[bin]]\nname = \"tool\"\nlinks = [\"pthread\"]\n",
             &[],
         );
+        assert_eq!(targets[1].links, vec!["pthread".to_string()]);
+        assert_eq!(targets[1].link_dirs, Vec::<PathBuf>::new());
         let lib = &targets[0];
+        assert_eq!(lib.links, vec!["z".to_string()]);
+        assert_eq!(lib.link_dirs, vec![PathBuf::from("vendor")]);
         assert_eq!(lib.entry, PathBuf::from("lib/core.cpp"));
         assert_eq!(lib.sources, vec!["lib/**/*.cpp".to_string()]);
         assert_eq!(lib.exclude, vec!["lib/test/**".to_string()]);

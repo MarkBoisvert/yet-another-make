@@ -237,7 +237,7 @@ fn build_command(tool: Tool, dir: &Path, build: &Path, plan: &Plan) -> String {
         Tool::Ninja => join(&["ninja", "-C", &path(build), "-j", &jobs]),
         Tool::CmakeBuild => join(&["cmake", "--build", &path(build), "--parallel", &jobs]),
         Tool::Yam => {
-            let yam = plan.yam.as_deref().map(path).unwrap_or_default();
+            let yam = plan.yam.as_deref().map_or_default(path);
             join(&[&yam, "build", &path(dir)])
         }
     }
@@ -256,7 +256,7 @@ fn prepare_command(
         "noop" => None,
         "cold" => Some(match tool {
             Tool::Yam => {
-                let yam = plan.yam.as_deref().map(path).unwrap_or_default();
+                let yam = plan.yam.as_deref().map_or_default(path);
                 join(&[&yam, "clean", &path(dir)])
             }
             _ => join(&["ninja", "-C", &path(build), "-t", "clean"]),

@@ -15,7 +15,9 @@ use serde::Deserialize;
 pub use cpp_std::{CppStd, ParseCppStdError};
 pub use sources::{GlobError, GlobList, SourceTree};
 pub use targets::{Target, TargetKind, resolve_targets};
-pub use validate::{Diagnostic, Severity, check_name, has_errors, report, validate};
+pub use validate::{
+    Diagnostic, Severity, check_name, has_errors, is_link_path, report, validate, validate_tree,
+};
 
 /// The manifest's file name, at the root of every project.
 pub const MANIFEST_FILE_NAME: &str = "Yam.toml";
@@ -66,6 +68,14 @@ pub struct TargetSpec {
     /// Header search directories, relative to the project root.
     #[serde(default)]
     pub include_dirs: Vec<PathBuf>,
+    /// Libraries to link: a name such as `pthread` (`-lpthread`), or the path of a
+    /// library file inside the project, such as `vendor/libacme.a`. A bin that links
+    /// the project library also links the library's `links`.
+    #[serde(default)]
+    pub links: Vec<String>,
+    /// Library search directories for `links` names, relative to the project root.
+    #[serde(default)]
+    pub link_dirs: Vec<PathBuf>,
 }
 
 /// One `[dependencies]` entry. `foo = "1.2"` is shorthand for `foo = { version = "1.2" }`.

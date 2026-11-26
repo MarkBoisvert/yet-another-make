@@ -237,4 +237,38 @@ mod tests {
             assert!(output.status.success(), "{style:?} binary failed");
         }
     }
+
+    /// Generates a small project in each style and builds it with `yam build`. Both
+    /// styles print the same total, since they share one dependency graph.
+    #[test]
+    fn generated_projects_build_with_yam() {
+        if Toolchain::discover().is_err() {
+            let required = std::env::var_os("CI").is_some() && !cfg!(windows);
+            assert!(!required, "CI needs the toolchain");
+            eprintln!("skipping: the toolchain is missing");
+            return;
+        }
+        let mut outputs = Vec::new();
+        for style in [Style::Modules, Style::Legacy] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path();
+            project::generate(dir, &Meta::new(style, 10, 3, 2, 1)).unwrap();
+            yet_another_make::commands::build::run(&yet_another_make::cli::BuildArgs {
+                path: dir.to_path_buf(),
+                release: false,
+                verbose: false,
+                lib: false,
+                bins: Vec::new(),
+            })
+            .unwrap();
+            let exe = dir.join(format!(
+                "target/Debug/bench{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+            let output = Command::new(exe).output().unwrap();
+            assert!(output.status.success(), "{style:?} binary failed");
+            outputs.push(String::from_utf8(output.stdout).unwrap());
+        }
+        assert_eq!(outputs[0], outputs[1]);
+    }
 }

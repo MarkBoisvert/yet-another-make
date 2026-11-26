@@ -103,6 +103,20 @@ pub fn check_name(kind: &str, name: &str) -> Result<(), String> {
 /// Fails only if the project tree can't be read. Problems with the manifest itself are
 /// returned as diagnostics.
 pub fn validate(manifest: &Manifest, root: &Path) -> Result<Vec<Diagnostic>, ManifestError> {
+    validate_tree(manifest, root, &SourceTree::scan(root)?)
+}
+
+/// [`validate`] against an already scanned `tree` of the files under `root`, so a
+/// build that also needs the tree walks the project only once.
+///
+/// # Errors
+///
+/// Fails only if the project tree can't be read.
+pub fn validate_tree(
+    manifest: &Manifest,
+    root: &Path,
+    tree: &SourceTree,
+) -> Result<Vec<Diagnostic>, ManifestError> {
     let mut out = Vec::new();
 
     check_project(manifest, &mut out);
@@ -114,7 +128,7 @@ pub fn validate(manifest: &Manifest, root: &Path) -> Result<Vec<Diagnostic>, Man
     check_dependencies(manifest, &mut out);
 
     match resolve_targets(manifest, root) {
-        Ok(targets) => check_files(manifest, &targets, root, &mut out)?,
+        Ok(targets) => check_files(manifest, &targets, root, tree, &mut out),
         Err(err @ ManifestError::NoTargets { .. }) => {
             out.push(Diagnostic::error("project", err.to_string()));
         }
@@ -168,13 +182,7 @@ fn check_spec(key: &str, spec: &TargetSpec, root: &Path, out: &mut Vec<Diagnosti
     if let Some(path) = &spec.path
         && !stays_inside_root(path)
     {
-        out.push(Diagnostic::error(
-            format!("{key}.path"),
-            format!(
-                "'{key}.path' = '{}' must be relative and inside the project root",
-                path.display()
-            ),
-        ));
+        out.push(outside_root(&format!("{key}.path"), path));
     }
     for (field, globs) in [
         ("sources", spec.sources.as_deref()),
@@ -189,23 +197,74 @@ fn check_spec(key: &str, spec: &TargetSpec, root: &Path, out: &mut Vec<Diagnosti
             ));
         }
     }
-    for (i, dir) in spec.include_dirs.iter().enumerate() {
-        let dir_key = format!("{key}.include-dirs[{i}]");
-        if !stays_inside_root(dir) {
-            out.push(Diagnostic::error(
-                dir_key.clone(),
-                format!(
-                    "'{dir_key}' = '{}' must be relative and inside the project root",
-                    dir.display()
-                ),
-            ));
-        } else if !root.join(dir).is_dir() {
-            out.push(Diagnostic::warning(
-                dir_key.clone(),
-                format!("'{dir_key}': directory '{}' does not exist", dir.display()),
-            ));
+    for (field, dirs) in [
+        ("include-dirs", &spec.include_dirs),
+        ("link-dirs", &spec.link_dirs),
+    ] {
+        for (i, dir) in dirs.iter().enumerate() {
+            let dir_key = format!("{key}.{field}[{i}]");
+            if !stays_inside_root(dir) {
+                out.push(outside_root(&dir_key, dir));
+            } else if !root.join(dir).is_dir() {
+                out.push(Diagnostic::warning(
+                    dir_key.clone(),
+                    format!("'{dir_key}': directory '{}' does not exist", dir.display()),
+                ));
+            }
         }
     }
+    for (i, link) in spec.links.iter().enumerate() {
+        check_link(&format!("{key}.links[{i}]"), link, root, out);
+    }
+}
+
+fn outside_root(key: &str, path: &Path) -> Diagnostic {
+    Diagnostic::error(
+        key,
+        format!(
+            "'{key}' = '{}' must be relative and inside the project root",
+            path.display()
+        ),
+    )
+}
+
+/// A `links` entry is either a library file inside the project or a library name.
+fn check_link(key: &str, link: &str, root: &Path, out: &mut Vec<Diagnostic>) {
+    if is_link_path(link) {
+        let path = Path::new(link);
+        if !stays_inside_root(path) {
+            out.push(outside_root(key, path));
+        } else if !root.join(path).is_file() {
+            out.push(Diagnostic::error(
+                key,
+                format!("'{key}': library file '{link}' does not exist"),
+            ));
+        }
+        return;
+    }
+    let valid = !link.is_empty()
+        && !link.starts_with('-')
+        && !link.contains(|c: char| c.is_whitespace() || c.is_control());
+    if !valid {
+        out.push(
+            Diagnostic::error(key, format!("'{key}' = '{link}' is not a library name")).with_help(
+                "use a name such as \"pthread\" (linked as -lpthread), or the path \
+                     of a library file such as \"vendor/libacme.a\"",
+            ),
+        );
+    }
+}
+
+/// Whether a `links` entry names a library file rather than a library: it has a
+/// directory part or a library file extension.
+#[must_use]
+pub fn is_link_path(link: &str) -> bool {
+    const LIBRARY_EXTENSIONS: [&str; 5] = ["a", "so", "dylib", "lib", "tbd"];
+    link.contains(['/', '\\'])
+        || Path::new(link)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| LIBRARY_EXTENSIONS.contains(&ext))
 }
 
 fn check_duplicate_bins(manifest: &Manifest, out: &mut Vec<Diagnostic>) {
@@ -252,9 +311,9 @@ fn check_files(
     manifest: &Manifest,
     targets: &[Target],
     root: &Path,
+    tree: &SourceTree,
     out: &mut Vec<Diagnostic>,
-) -> Result<(), ManifestError> {
-    let tree = SourceTree::scan(root)?;
+) {
     let mut lib_files: Option<HashSet<String>> = None;
     let mut bin_files = Vec::new();
 
@@ -290,7 +349,7 @@ fn check_files(
             let spec = spec_for(manifest, spec_key);
             if spec.and_then(|s| s.sources.as_ref()).is_some() {
                 warn_unmatched(
-                    &tree,
+                    tree,
                     &include,
                     &target.sources,
                     &format!("{spec_key}.sources"),
@@ -301,7 +360,7 @@ fn check_files(
                 let user_exclude: Vec<String> = spec.exclude.clone();
                 if let Ok(user_exclude_globs) = GlobList::new(&user_exclude) {
                     warn_unmatched(
-                        &tree,
+                        tree,
                         &user_exclude_globs,
                         &user_exclude,
                         &format!("{spec_key}.exclude"),
@@ -338,7 +397,6 @@ fn check_files(
     if let Some(lib_files) = &lib_files {
         check_lib_overlap(lib_files, &bin_files, out);
     }
-    Ok(())
 }
 
 /// A file in the library's source set must not also be in a bin's: the bin links the
@@ -551,6 +609,44 @@ mod tests {
             keys(&diagnostics),
             [(Severity::Warning, "lib.include-dirs[0]")]
         );
+    }
+
+    #[test]
+    fn links_and_link_dirs() {
+        let diagnostics = run(
+            "[project]\nname = \"app\"\n[lib]\nlinks = [\"pthread\", \"vendor/libacme.a\", \"libgone.a\", \"-lz\", \"\", \"../x/libz.a\"]\nlink-dirs = [\"vendor\", \"missing\", \"/opt/lib\"]\n",
+            &["src/lib.cppm", "vendor/libacme.a"],
+        );
+        assert_eq!(
+            keys(&diagnostics),
+            [
+                (Severity::Warning, "lib.link-dirs[1]"),
+                (Severity::Error, "lib.link-dirs[2]"),
+                (Severity::Error, "lib.links[2]"),
+                (Severity::Error, "lib.links[3]"),
+                (Severity::Error, "lib.links[4]"),
+                (Severity::Error, "lib.links[5]"),
+            ]
+        );
+        assert_eq!(
+            diagnostics[2].message,
+            "'lib.links[2]': library file 'libgone.a' does not exist"
+        );
+        assert_eq!(
+            diagnostics[3].message,
+            "'lib.links[3]' = '-lz' is not a library name"
+        );
+    }
+
+    #[test]
+    fn link_entries_with_a_directory_or_library_extension_are_paths() {
+        assert!(!is_link_path("pthread"));
+        assert!(!is_link_path("stdc++fs"));
+        assert!(!is_link_path("boost_system-mt"));
+        assert!(is_link_path("vendor/libacme.a"));
+        assert!(is_link_path("libacme.a"));
+        assert!(is_link_path("acme.lib"));
+        assert!(is_link_path("lib\\acme"));
     }
 
     #[test]
