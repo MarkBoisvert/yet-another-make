@@ -346,7 +346,12 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Graph of modules, objects, `std.pcm` and link steps, with one `std.pcm` per
       distinct project standard that uses `import std`.
     - Staleness from mtime with a content-hash fallback, plus a command-line hash.
-    - Cycles are reported with the module chain.
+      Inputs: source, recorded headers (#23), every compiled interface read
+      (transitively), and for archives and links their objects and libraries.
+    - Restat by contents: a byte-identical `.pcm`, object or archive leaves what
+      depends on it fresh. (Rare in Debug: DWARF 5 embeds source checksums.)
+    - Until #26 the record is `target/<Profile>/.yam/outputs.json`.
+    - Cycles are reported with the module chain, e.g. `a` → `b` → `a`.
 25. **Parallel scheduler** (engine, perf)
     - Topological execution, `-j` defaulting to the number of CPUs.
     - Keep going on failure; output is grouped per job.

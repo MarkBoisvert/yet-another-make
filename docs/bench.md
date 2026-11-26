@@ -20,9 +20,9 @@ cargo run -p bench --release -- report   # print the tables below
   every measurement. Cells already there are skipped, so a run can be stopped and
   resumed.
 - **Narrowing a run:** `--styles`, `--sizes`, `--scenarios` and `--jobs` pick a subset.
-- **Timing yam:** `--yam <path>` adds a `yam build` column. Until staleness (#24) and
-  the parallel scheduler (#25) land, `yam build` recompiles every file one at a time,
-  so yam's column is a correctness check more than a measurement.
+- **Timing yam:** `--yam <path>` adds a `yam build` column. Since #24, `yam build`
+  rebuilds only stale outputs, but it compiles them one at a time until the parallel
+  scheduler (#25), so its `cold` and large-edit numbers aren't comparable yet.
 
 ## Method
 

@@ -57,7 +57,8 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
    `clang-scan-deps -format=p1689` call covers every file whose scan isn't cached
    (`src/engine/scan.rs`, `src/engine/scan_cache.rs`).
 7. **Build the graph** of module interfaces, objects, `std.pcm` and link steps (#24).
-8. **Decide staleness** for each node (#24).
+8. **Decide staleness** for each node (#24), as it's reached: a node runs only when
+   its output is stale.
 9. **Schedule** stale nodes in parallel, in dependency order (#25).
 10. **Link** binaries and archive libraries.
 11. **Persist** the updated state file (#26).
@@ -177,24 +178,41 @@ artifact**. It is rebuilt only when one of these changes:
 Recompiling it on every invocation would put a ~2s floor under every no-op build and
 make the no-op gate in #28 impossible.
 
-## Staleness — Proposed (#24)
+## Staleness — Decided (#24)
+
+The build graph (`src/engine/graph.rs`) has a node for the `std` module, each compile,
+the library's archive and each bin's link, and lists what each node needs. Nodes are
+run in an order where every node follows what it needs; each one first checks the
+output record (`src/engine/outputs.rs`) and is skipped when its output is fresh.
 
 An output is stale if any of these hold:
 
-- it's missing
-- its **command hash** differs from the recorded one (the hash covers the full argv,
-  the compiler identity and the relevant environment)
-- any recorded input (the source, depfile headers, imported module interfaces,
-  `std.pcm`) has a newer mtime than recorded
-- for an input whose mtime changed: its blake3 content hash differs from the recorded
-  hash
+- it's missing (for a module interface, its `.pcm` too)
+- its **command hash** differs from the recorded one (the hash covers the full argv and
+  the compiler's path and version)
+- its set of inputs changed
+- any input's blake3 contents hash differs from the one it was built from
 
-The content-hash fallback turns `touch`, `git checkout` and editor save-without-change
-into no-ops. Hashing happens only when an mtime has already moved, so the common path
-is `stat` alone.
+Inputs are the source, the project headers from its last depfile (#23), and every
+compiled interface it reads, directly or through the modules it imports, including
+`std.pcm`; for an archive, its objects; for a link, its objects, `std.o`, the library's
+archive and any library files named in `links`.
 
-Like ninja's `restat`: when a module interface is recompiled but its output (`.pcm`)
-comes out byte-identical, yam does not treat its importers as dirty.
+- **`stat` first.** Each input's mtime and size are compared with the last time yam
+  saw the file; only when they moved is it read and hashed. So a no-op build is `stat`
+  calls alone, and `touch`, `git checkout` and a save without changes rebuild nothing.
+- **Inputs are recorded as they were checked,** before the step ran. A file edited
+  while it was being compiled is seen as changed by the next build.
+- **Restat, like ninja's:** an importer compares a `.pcm`'s contents, not its mtime, so
+  a recompile that produces a byte-identical output leaves what depends on it fresh.
+  The same holds for objects and archives. In Debug builds this rarely applies,
+  because `-g` writes DWARF 5, which embeds each source file's checksum; any edit
+  changes the object.
+- **The record** is `target/<Profile>/.yam/outputs.json` until the state file (#26),
+  with paths and hashes interned. A no-op build doesn't rewrite it, and a failed
+  build keeps the outputs it finished.
+- `std.pcm`/`std.o` keep their own stamp (see [std.pcm](#stdpcm--decided)); what they
+  feed is tracked by contents like any other input.
 
 ## Build state file — Proposed (#26)
 
@@ -237,6 +255,7 @@ target/
     ├── .yam/
     │   ├── scan-cache.json   # scan results (#22), until the state file takes them over
     │   ├── headers.json      # each object's project headers (#23), likewise
+    │   ├── outputs.json      # what each output was built from (#24), likewise
     │   └── state             # build state file (#26)
     ├── std/<std>/            # std.pcm + std.o per standard in use, e.g. std/c++26/
     ├── modules/<project>/    # the library's compiled module interfaces (.pcm)
