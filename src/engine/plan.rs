@@ -71,9 +71,10 @@ pub enum PlanError {
         module: String,
     },
 
-    #[error("modules in {target} import each other in a cycle: {}", quoted(.modules))]
+    #[error("modules in {target} import each other in a cycle: {}", chain(.modules))]
     Cycle {
         target: String,
+        /// The cycle, starting and ending with the same module.
         modules: Vec<String>,
     },
 
@@ -90,6 +91,15 @@ pub enum PlanError {
         quoted(.files)
     )]
     TwoMains { target: String, files: Vec<String> },
+}
+
+/// `` `a` → `b` → `a` ``.
+fn chain(modules: &[String]) -> String {
+    modules
+        .iter()
+        .map(|module| format!("`{module}`"))
+        .collect::<Vec<_>>()
+        .join(" → ")
 }
 
 fn quoted(items: &[String]) -> String {
@@ -237,15 +247,28 @@ fn order_providers(
         });
     }
 
-    if !waiting.is_empty() {
-        let mut modules: Vec<String> = waiting
-            .keys()
-            .filter_map(|&file| files[file].provides().map(String::from))
-            .collect();
-        modules.sort();
+    if let Some(&start) = waiting.keys().next() {
+        // Every file still waiting needs another waiting file, so following those
+        // needs from any of them must come back around.
+        let mut path = vec![start];
+        loop {
+            let last = path[path.len() - 1];
+            let Some(&next) = needs[last].iter().find(|n| waiting.contains_key(n)) else {
+                break;
+            };
+            if let Some(seen) = path.iter().position(|&file| file == next) {
+                path.drain(..seen);
+                path.push(next);
+                break;
+            }
+            path.push(next);
+        }
         return Err(PlanError::Cycle {
             target: target.to_string(),
-            modules,
+            modules: path
+                .iter()
+                .filter_map(|&file| files[file].provides().map(String::from))
+                .collect(),
         });
     }
     Ok(steps)
@@ -364,7 +387,18 @@ mod tests {
         ];
         assert_eq!(
             error(&files),
-            "modules in bin target `app` import each other in a cycle: `a`, `b`"
+            "modules in bin target `app` import each other in a cycle: `a` → `b` → `a`"
+        );
+        // A longer cycle, reached from a file outside it.
+        let files = [
+            file("a.cppm", Some("a"), &["b"]),
+            file("b.cppm", Some("b"), &["c"]),
+            file("c.cppm", Some("c"), &["d"]),
+            file("d.cppm", Some("d"), &["b"]),
+        ];
+        assert_eq!(
+            error(&files),
+            "modules in bin target `app` import each other in a cycle: `b` → `c` → `d` → `b`"
         );
     }
 

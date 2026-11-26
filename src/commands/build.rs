@@ -2,14 +2,15 @@
 //! link the bins.
 //!
 //! One batched `clang-scan-deps` call finds the module dependencies of every new or
-//! changed file ([`engine::scan`], cached by [`engine::ScanCache`]), and each
-//! target's files are compiled in the order [`engine::plan`] gives. Every file is
-//! compiled on every build, one at a time; only `std.pcm` and scan results are reused
-//! between builds so far. Staleness (#24) and the parallel scheduler (#25) replace
-//! most of this.
+//! changed file ([`engine::scan`], cached by [`engine::ScanCache`]), each target's
+//! files are put in compile order ([`engine::plan`]), and the build graph
+//! ([`engine::graph`]) is run one node at a time. A node whose output is fresh, by the
+//! output record ([`engine::Outputs`]), is skipped, so a no-op build compiles
+//! nothing. The parallel scheduler (#25) runs independent nodes at the same time.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::BuildArgs;
 use crate::engine::{
-    self, Deps, FlagsHash, HeaderRecord, Key, Plan, STD_MODULE, ScanCache, ScanJob, SourceFile,
+    self, Action, CommandHash, Deps, FlagsHash, GraphTarget, HeaderRecord, Key, Outputs, Plan,
+    STD_MODULE, ScanCache, ScanJob, SourceFile,
 };
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
@@ -145,25 +147,72 @@ pub fn run(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
-/// Scan, order, compile, archive and link the selected targets.
+/// Scan and order the selected targets, then run the build graph, skipping every
+/// node whose output is fresh.
 fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
     let prepared = builder.prepare(selected)?;
-    let imports_std = prepared.iter().any(|p| p.plan.imports_std);
-    let std_module = if imports_std {
-        Some(builder.std_module()?)
-    } else {
-        None
-    };
+    let graph_targets: Vec<GraphTarget<'_>> = prepared
+        .iter()
+        .map(|p| GraphTarget {
+            is_lib: p.target.kind == TargetKind::Lib,
+            links_lib: p.target.links_lib,
+            files: &p.files,
+            plan: &p.plan,
+        })
+        .collect();
+    let nodes = engine::graph(&graph_targets);
+    let lib = prepared
+        .iter()
+        .find(|p| p.target.kind == TargetKind::Lib)
+        .map(|p| builder.lib(p));
 
-    let mut lib = None;
-    for target in &prepared {
-        match target.target.kind {
-            TargetKind::Lib => lib = Some(builder.lib(target, std_module.as_ref())?),
-            TargetKind::Bin => {
-                let lib = lib.as_ref().filter(|_| target.target.links_lib);
-                builder.bin(target, std_module.as_ref(), lib)?;
+    let mut std_module: Option<StdModule> = None;
+    // The compiled module interfaces each node reads, directly or through the
+    // modules it imports.
+    let mut pcms: Vec<Vec<PathBuf>> = vec![Vec::new(); nodes.len()];
+    let (mut ran, mut compiles) = (0, 0);
+    for (id, node) in nodes.iter().enumerate() {
+        let mut reads = std::collections::BTreeSet::new();
+        for &need in &node.needs {
+            match nodes[need].action {
+                Action::Std => {
+                    if let Some(std) = &std_module {
+                        reads.insert(std.pcm.clone());
+                    }
+                }
+                Action::Compile { target, step } => {
+                    if let Some(pcm) = builder.pcm_path(&prepared[target], step) {
+                        reads.insert(pcm);
+                    }
+                    reads.extend(pcms[need].iter().cloned());
+                }
+                Action::Archive { .. } | Action::Link { .. } => {}
             }
         }
+        pcms[id] = reads.into_iter().collect();
+
+        match node.action {
+            Action::Std => std_module = Some(builder.std_module()?),
+            Action::Compile { target, step } => {
+                let prepared = &prepared[target];
+                let lib = lib.as_ref().filter(|_| {
+                    prepared.target.kind == TargetKind::Bin && prepared.target.links_lib
+                });
+                compiles += 1;
+                if builder.compile(prepared, step, std_module.as_ref(), lib, &pcms[id])? {
+                    ran += 1;
+                }
+            }
+            Action::Archive { target } => builder.archive(&prepared[target])?,
+            Action::Link { target } => {
+                let prepared = &prepared[target];
+                let lib = lib.as_ref().filter(|_| prepared.target.links_lib);
+                builder.link(prepared, std_module.as_ref(), lib)?;
+            }
+        }
+    }
+    if builder.verbose {
+        style::status("Compiled", format!("{ran} of {compiles} files"));
     }
     Ok(())
 }
@@ -173,6 +222,7 @@ fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
 struct Caches {
     scan: ScanCache,
     headers: HeaderRecord,
+    outputs: Outputs,
     /// Header contents hashes for this build, so each header is read once.
     header_hashes: HashMap<PathBuf, Option<blake3::Hash>>,
 }
@@ -188,9 +238,14 @@ impl Caches {
         if let Some(reason) = discarded {
             style::note(format!("{reason}; header dependencies start over"));
         }
+        let (outputs, discarded) = Outputs::load(&dir.join("outputs.json"));
+        if let Some(reason) = discarded {
+            style::note(format!("{reason}; building everything again"));
+        }
         Self {
             scan,
             headers,
+            outputs,
             header_hashes: HashMap::new(),
         }
     }
@@ -223,6 +278,9 @@ impl Caches {
         }
         if let Err(err) = self.headers.save_if_changed() {
             style::warning(format!("couldn't save the header record: {err}"));
+        }
+        if let Err(err) = self.outputs.save_if_changed() {
+            style::warning(format!("couldn't save the output record: {err}"));
         }
     }
 }
@@ -625,19 +683,47 @@ impl Builder<'_> {
         }
     }
 
-    /// Compile every file of `prepared` in plan order, returning the objects.
+    /// The compiler's identity, part of every command hash.
+    fn tools(&self) -> String {
+        format!(
+            "{} {}",
+            self.toolchain.cxx.path.display(),
+            self.toolchain.cxx.version
+        )
+    }
+
+    /// The object a target's plan step compiles to.
+    fn object(&self, prepared: &Prepared<'_>, step: usize) -> PathBuf {
+        let (obj_dir, _) = self.target_dirs(prepared.target);
+        let file = prepared.plan.steps[step].file;
+        object_file(&obj_dir, &prepared.files[file].path)
+    }
+
+    /// The compiled interface a target's plan step writes, if its file provides a
+    /// module.
+    fn pcm_path(&self, prepared: &Prepared<'_>, step: usize) -> Option<PathBuf> {
+        let (_, module_dir) = self.target_dirs(prepared.target);
+        let module = prepared.plan.steps[step].provides.as_ref()?;
+        Some(module_dir.join(pcm_name(module)))
+    }
+
+    /// Compile one file, unless its object (and interface) are fresh. `pcms` are the
+    /// compiled interfaces it reads. Returns whether it ran.
     fn compile(
         &self,
         prepared: &Prepared<'_>,
+        step: usize,
         std: Option<&StdModule>,
         lib: Option<&Lib>,
-    ) -> Result<(Vec<PathBuf>, Option<PathBuf>)> {
+        pcms: &[PathBuf],
+    ) -> Result<bool> {
         let target = prepared.target;
-        let (obj_dir, module_dir) = self.target_dirs(target);
-        let has_modules = prepared.plan.steps.iter().any(|s| s.provides.is_some());
-        if has_modules {
-            create_dir(&module_dir)?;
-        }
+        let (_, module_dir) = self.target_dirs(target);
+        let file = prepared.plan.steps[step].file;
+        let source = self.root.join(&prepared.files[file].path);
+        let object = self.object(prepared, step);
+        let pcm = self.pcm_path(prepared, step);
+        let depfile = depfile_path(&object);
 
         let mut include_dirs: Vec<PathBuf> = target
             .include_dirs
@@ -645,81 +731,106 @@ impl Builder<'_> {
             .map(|dir| self.root.join(dir))
             .collect();
         let mut module_dirs = Vec::new();
-        if has_modules {
-            module_dirs.push(module_dir.clone());
+        if prepared.plan.steps.iter().any(|s| s.provides.is_some()) {
+            module_dirs.push(module_dir);
         }
         if let Some(lib) = lib {
             include_dirs.extend(lib.include_dirs.iter().cloned());
             module_dirs.extend(lib.module_dir.iter().cloned());
         }
 
-        let failure = could_not("compile", target);
-        let mut objects = Vec::with_capacity(prepared.plan.steps.len());
-        for step in &prepared.plan.steps {
-            let source = &prepared.files[step.file].path;
-            let object = object_path(&obj_dir, source)?;
-            let mut compile = self.compile_command();
-            if let Some(std) = std {
-                compile.arg(format!("-fmodule-file=std={}", std.pcm.display()));
-            }
-            for dir in &module_dirs {
-                compile.arg(format!("-fprebuilt-module-path={}", dir.display()));
-            }
-            for dir in &include_dirs {
-                compile.arg(format!("-I{}", dir.display()));
-            }
-            if let Some(module) = &step.provides {
-                let pcm = module_dir.join(pcm_name(module));
-                compile.arg(format!("-fmodule-output={}", pcm.display()));
-                // `.cppm` is a module interface by its extension; anything else that
-                // declares a module needs saying so.
-                if !engine::has_extension(source, "cppm") {
-                    compile.args(["-x", "c++-module"]);
-                }
-            }
-            let depfile = depfile_path(&object);
-            compile
-                .arg("-MMD")
-                .arg("-MF")
-                .arg(&depfile)
-                .arg("-c")
-                .arg(self.root.join(source))
-                .arg("-o")
-                .arg(&object);
-            self.run(&mut compile, &failure)?;
-            self.record_headers(prepared, step.file, &object, &depfile);
-            objects.push(object);
+        let mut compile = self.compile_command();
+        if let Some(std) = std {
+            compile.arg(format!("-fmodule-file=std={}", std.pcm.display()));
         }
-        Ok((objects, has_modules.then_some(module_dir)))
+        for dir in &module_dirs {
+            compile.arg(format!("-fprebuilt-module-path={}", dir.display()));
+        }
+        for dir in &include_dirs {
+            compile.arg(format!("-I{}", dir.display()));
+        }
+        if let Some(pcm) = &pcm {
+            compile.arg(format!("-fmodule-output={}", pcm.display()));
+            // `.cppm` is a module interface by its extension; anything else that
+            // declares a module needs saying so.
+            if !engine::has_extension(&prepared.files[file].path, "cppm") {
+                compile.args(["-x", "c++-module"]);
+            }
+        }
+        compile
+            .arg("-MMD")
+            .arg("-MF")
+            .arg(&depfile)
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object);
+        let command = command_hash(&self.tools(), &compile);
+
+        let headers = self.caches.borrow().headers.get(&object).to_vec();
+        let inputs = self.compile_inputs(&source, &headers, pcms);
+        let fresh = self
+            .caches
+            .borrow_mut()
+            .outputs
+            .is_fresh(&object, command, &inputs);
+        if fresh && pcm.as_ref().is_none_or(|pcm| pcm.exists()) {
+            return Ok(false);
+        }
+
+        create_parent(&object)?;
+        if let Some(pcm) = &pcm {
+            create_parent(pcm)?;
+        }
+        self.run(&mut compile, &could_not("compile", target))?;
+        let headers = self.record_headers(prepared, file, &object, &depfile);
+        let inputs = self.compile_inputs(&source, &headers, pcms);
+        let mut caches = self.caches.borrow_mut();
+        caches.outputs.record(&object, command, &inputs);
+        caches.outputs.invalidate(&object);
+        if let Some(pcm) = &pcm {
+            caches.outputs.invalidate(pcm);
+        }
+        Ok(true)
+    }
+
+    /// What a compile reads: the source, its project headers and the compiled
+    /// interfaces it imports.
+    fn compile_inputs(&self, source: &Path, headers: &[String], pcms: &[PathBuf]) -> Vec<PathBuf> {
+        std::iter::once(source.to_path_buf())
+            .chain(headers.iter().map(|header| self.root.join(header)))
+            .chain(pcms.iter().cloned())
+            .collect()
     }
 
     /// Read a compiled file's depfile into the header record, and file its scan
     /// result under the key for those headers, so the next build finds it. A missing
-    /// or unreadable depfile records no headers.
-    fn record_headers(&self, prepared: &Prepared<'_>, file: usize, object: &Path, depfile: &Path) {
+    /// or unreadable depfile records no headers. Returns the headers.
+    fn record_headers(
+        &self,
+        prepared: &Prepared<'_>,
+        file: usize,
+        object: &Path,
+        depfile: &Path,
+    ) -> Vec<String> {
         let source = self.root.join(&prepared.files[file].path);
         let deps = fs::read_to_string(depfile).map_or_default(|text| engine::depfile::parse(&text));
         let headers = engine::headers_from_depfile(deps, self.root, &source);
         let mut caches = self.caches.borrow_mut();
         let key = caches.key_with(self.root, &prepared.keys[file], &headers);
         caches.scan.insert(key, prepared.files[file].deps.clone());
-        caches.headers.record(object, headers);
+        caches.headers.record(object, headers.clone());
+        headers
     }
 
-    fn lib(&self, prepared: &Prepared<'_>, std: Option<&StdModule>) -> Result<Lib> {
+    /// The library as a bin uses it. Nothing is built here.
+    fn lib(&self, prepared: &Prepared<'_>) -> Lib {
         let target = prepared.target;
-        let (objects, module_dir) = self.compile(prepared, std, None)?;
-
-        let archive = self.out.join(format!("lib{}.a", target.name));
-        let _ = fs::remove_file(&archive);
-        let mut ar = Command::new(&self.toolchain.ar);
-        ar.arg("rcs").arg(&archive);
-        self.add_files(&mut ar, &objects, &format!("lib{}.a", target.name))?;
-        self.run(&mut ar, &could_not("archive", target))?;
-
-        Ok(Lib {
-            archive,
-            module_dir,
+        let (_, module_dir) = self.target_dirs(target);
+        let has_modules = prepared.plan.steps.iter().any(|s| s.provides.is_some());
+        Lib {
+            archive: self.out.join(format!("lib{}.a", target.name)),
+            module_dir: has_modules.then_some(module_dir),
             include_dirs: target
                 .include_dirs
                 .iter()
@@ -727,31 +838,72 @@ impl Builder<'_> {
                 .collect(),
             links: target.links.clone(),
             link_dirs: target.link_dirs.clone(),
-        })
+        }
     }
 
-    fn bin(
+    /// A target's objects, in plan order.
+    fn objects(&self, prepared: &Prepared<'_>) -> Vec<PathBuf> {
+        (0..prepared.plan.steps.len())
+            .map(|step| self.object(prepared, step))
+            .collect()
+    }
+
+    /// Archive the library's objects, unless the archive is fresh.
+    fn archive(&self, prepared: &Prepared<'_>) -> Result<()> {
+        let target = prepared.target;
+        let objects = self.objects(prepared);
+        let archive = self.out.join(format!("lib{}.a", target.name));
+        let before = [OsString::from("rcs"), archive.clone().into_os_string()];
+        let command = CommandHash::new(
+            &self.toolchain.ar.display().to_string(),
+            before
+                .iter()
+                .map(OsString::as_os_str)
+                .chain(objects.iter().map(|o| o.as_os_str())),
+        );
+        if self
+            .caches
+            .borrow_mut()
+            .outputs
+            .is_fresh(&archive, command, &objects)
+        {
+            return Ok(());
+        }
+
+        let _ = fs::remove_file(&archive);
+        let mut ar = Command::new(&self.toolchain.ar);
+        ar.args(&before);
+        self.add_files(&mut ar, &objects, &format!("lib{}.a", target.name))?;
+        self.run(&mut ar, &could_not("archive", target))?;
+        let mut caches = self.caches.borrow_mut();
+        caches.outputs.record(&archive, command, &objects);
+        caches.outputs.invalidate(&archive);
+        Ok(())
+    }
+
+    /// Link a bin, unless its executable is fresh.
+    fn link(
         &self,
         prepared: &Prepared<'_>,
         std: Option<&StdModule>,
         lib: Option<&Lib>,
     ) -> Result<()> {
         let target = prepared.target;
-        let (mut objects, _) = self.compile(prepared, std, lib)?;
+        let mut objects = self.objects(prepared);
         if let Some(std) = std {
             objects.push(std.object.clone());
         }
-
         let executable = self
             .out
             .join(format!("{}{}", target.name, std::env::consts::EXE_SUFFIX));
-        let mut link = Command::new(&self.toolchain.cxx.path);
-        link.arg("-stdlib=libc++");
-        self.add_files(&mut link, &objects, &target.name)?;
-        if let Some(lib) = lib {
-            link.arg(&lib.archive);
-        }
 
+        // Everything after the objects; library files are inputs too.
+        let mut after: Vec<OsString> = Vec::new();
+        let mut inputs = objects.clone();
+        if let Some(lib) = lib {
+            after.push(lib.archive.clone().into_os_string());
+            inputs.push(lib.archive.clone());
+        }
         // The bin's own libraries, then the project library's, which its archive
         // needs but can't carry.
         let lib_links = lib.map(|lib| (&lib.links, &lib.link_dirs));
@@ -759,27 +911,55 @@ impl Builder<'_> {
             std::iter::once((&target.links, &target.link_dirs)).chain(lib_links)
         {
             for dir in link_dirs {
-                link.arg(format!("-L{}", self.root.join(dir).display()));
+                after.push(format!("-L{}", self.root.join(dir).display()).into());
             }
             for name in links {
                 if is_link_path(name) {
-                    link.arg(self.root.join(name));
+                    let path = self.root.join(name);
+                    after.push(path.clone().into_os_string());
+                    inputs.push(path);
                 } else {
-                    link.arg(format!("-l{name}"));
+                    after.push(format!("-l{name}").into());
                 }
             }
         }
-
         // Link against the libc++ that matches the headers, not whichever one the
         // linker finds first (Homebrew's lives outside the default search path).
         if let Some(dir) = libcxx_dir(self.toolchain) {
-            link.arg(format!("-L{}", dir.display()));
+            after.push(format!("-L{}", dir.display()).into());
             if cfg!(target_os = "macos") {
-                link.arg(format!("-Wl,-rpath,{}", dir.display()));
+                after.push(format!("-Wl,-rpath,{}", dir.display()).into());
             }
         }
-        link.arg("-o").arg(&executable);
-        self.run(&mut link, &could_not("link", target))
+        after.push("-o".into());
+        after.push(executable.clone().into_os_string());
+
+        let before = OsString::from("-stdlib=libc++");
+        let command = CommandHash::new(
+            &self.tools(),
+            std::iter::once(self.toolchain.cxx.path.as_os_str())
+                .chain([before.as_os_str()])
+                .chain(objects.iter().map(|o| o.as_os_str()))
+                .chain(after.iter().map(OsString::as_os_str)),
+        );
+        if self
+            .caches
+            .borrow_mut()
+            .outputs
+            .is_fresh(&executable, command, &inputs)
+        {
+            return Ok(());
+        }
+
+        let mut link = Command::new(&self.toolchain.cxx.path);
+        link.arg(&before);
+        self.add_files(&mut link, &objects, &target.name)?;
+        link.args(&after);
+        self.run(&mut link, &could_not("link", target))?;
+        let mut caches = self.caches.borrow_mut();
+        caches.outputs.record(&executable, command, &inputs);
+        caches.outputs.invalidate(&executable);
+        Ok(())
     }
 
     /// Add `files` to `command`, through a response file in `rsp/<name>.rsp` when the
@@ -818,16 +998,17 @@ impl Builder<'_> {
     }
 }
 
+/// A hash of `command` as it will run, with `tools` identifying the compiler.
+fn command_hash(tools: &str, command: &Command) -> CommandHash {
+    CommandHash::new(
+        tools,
+        std::iter::once(command.get_program()).chain(command.get_args()),
+    )
+}
+
 /// `<dir>/<source>.o`.
 fn object_file(dir: &Path, source: &str) -> PathBuf {
     dir.join(format!("{source}.o"))
-}
-
-/// `<dir>/<source>.o`, creating its directory.
-fn object_path(dir: &Path, source: &str) -> Result<PathBuf> {
-    let path = object_file(dir, source);
-    create_parent(&path)?;
-    Ok(path)
 }
 
 fn create_parent(path: &Path) -> Result<()> {
@@ -1079,6 +1260,219 @@ mod tests {
         // And settles again.
         run(&build_args(&dir)).unwrap();
         assert_eq!(scanned(&dir), None);
+    }
+
+    /// The modification time of every object, archive and executable a Debug build
+    /// left, by path relative to `target/Debug`.
+    fn outputs(dir: &Path) -> std::collections::BTreeMap<String, std::time::SystemTime> {
+        let debug = dir.join("target/Debug");
+        walkdir::WalkDir::new(&debug)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| {
+                let name = entry.file_name().to_string_lossy();
+                name.ends_with(".o")
+                    || name.ends_with(".a")
+                    || name.ends_with(".pcm")
+                    || entry.depth() == 1 && !name.contains('.')
+                    || name.ends_with(".exe")
+            })
+            .map(|entry| {
+                let path = entry.path().strip_prefix(&debug).unwrap();
+                let modified = entry.metadata().unwrap().modified().unwrap();
+                (manifest::slash_path(path), modified)
+            })
+            .collect()
+    }
+
+    /// The outputs whose mtime differs between two snapshots.
+    fn rebuilt(
+        before: &std::collections::BTreeMap<String, std::time::SystemTime>,
+        after: &std::collections::BTreeMap<String, std::time::SystemTime>,
+    ) -> Vec<String> {
+        after
+            .iter()
+            .filter(|(path, time)| before.get(*path) != Some(time))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    /// Set a file's mtime to now plus `seconds`, without changing its contents.
+    fn touch(path: &Path, seconds: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(seconds))
+            .unwrap();
+    }
+
+    #[test]
+    fn only_stale_outputs_are_rebuilt() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("calc");
+        new_project(&dir, true, false);
+        write(
+            &dir.join("src/lib.cpp"),
+            "module calc;\n\nnamespace calc {\nint twice(int x) { return 2 * x; }\n}\n",
+        );
+        let interface = fs::read_to_string(dir.join("src/lib.cppm")).unwrap();
+        write(
+            &dir.join("src/lib.cppm"),
+            &format!("{interface}\nexport namespace calc {{\nint twice(int x);\n}}\n"),
+        );
+        write(
+            &dir.join("src/main.cpp"),
+            "import std;\nimport calc;\n\nint main() {\n    std::println(\"{}\", calc::twice(calc::add(1, 2)));\n}\n",
+        );
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(run_binary(&exe(&dir, "Debug", "calc")), "6\n");
+        let exe_name = format!("calc{}", std::env::consts::EXE_SUFFIX);
+
+        // A no-op build, and one after `touch`, rewrite nothing.
+        let first = outputs(&dir);
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(rebuilt(&first, &outputs(&dir)), Vec::<String>::new());
+        touch(&dir.join("src/lib.cppm"), 5);
+        touch(&dir.join("src/main.cpp"), 5);
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(rebuilt(&first, &outputs(&dir)), Vec::<String>::new());
+
+        // An implementation change recompiles that file, re-archives and relinks.
+        write(
+            &dir.join("src/lib.cpp"),
+            "module calc;\n\nnamespace calc {\nint twice(int x) { return x + x + 1; }\n}\n",
+        );
+        let before = outputs(&dir);
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(
+            rebuilt(&before, &outputs(&dir)),
+            [
+                exe_name.clone(),
+                "libcalc.a".into(),
+                "obj/calc/lib/src/lib.cpp.o".into()
+            ]
+        );
+        assert_eq!(run_binary(&exe(&dir, "Debug", "calc")), "7\n");
+
+        // A deleted object is rebuilt on its own.
+        fs::remove_file(dir.join("target/Debug/obj/calc/bin/calc/src/main.cpp.o")).unwrap();
+        let before = outputs(&dir);
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(
+            rebuilt(&before, &outputs(&dir)),
+            ["obj/calc/bin/calc/src/main.cpp.o"]
+        );
+
+        // Different flags rebuild everything.
+        let manifest = fs::read_to_string(dir.join("Yam.toml")).unwrap();
+        assert!(manifest.contains("std = \"c++23\""), "{manifest}");
+        write(
+            &dir.join("Yam.toml"),
+            &manifest.replace("std = \"c++23\"", "std = \"c++26\""),
+        );
+        let before = outputs(&dir);
+        run(&build_args(&dir)).unwrap();
+        let after = outputs(&dir);
+        // Every object and interface is recompiled. The archive and executable may
+        // then be left alone, if those came out identical.
+        let compiled = before
+            .keys()
+            .filter(|p| p.starts_with("obj/") || p.starts_with("modules/"));
+        for path in compiled {
+            assert!(
+                rebuilt(&before, &after).contains(path),
+                "{path} wasn't rebuilt"
+            );
+        }
+        assert_eq!(run_binary(&exe(&dir, "Debug", "calc")), "7\n");
+    }
+
+    /// Like ninja's `restat`: a recompile whose output comes out byte-identical
+    /// doesn't make what depends on it stale. Release builds have no debug info, whose
+    /// source checksums would otherwise make every edit change the object.
+    #[test]
+    fn identical_outputs_stop_the_rebuild() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("same");
+        new_project(&dir, true, true);
+        write(
+            &dir.join("src/main.cpp"),
+            "#include <cstdio>\n#include \"same.hpp\"\n\nint main() {\n    std::printf(\"%d\\n\", same::add(1, 2));\n}\n",
+        );
+        let mut release = build_args(&dir);
+        release.release = true;
+        run(&release).unwrap();
+        let release_outputs = |dir: &Path| {
+            let debug = dir.join("target/Release");
+            ["libsame.a", "obj/same/lib/src/lib.cpp.o"]
+                .map(|p| fs::metadata(debug.join(p)).unwrap().modified().unwrap())
+        };
+        let before = release_outputs(&dir);
+        let text = fs::read_to_string(dir.join("src/lib.cpp")).unwrap();
+        write(
+            &dir.join("src/lib.cpp"),
+            &format!("{text}// a trailing comment\n"),
+        );
+        run(&release).unwrap();
+        let after = release_outputs(&dir);
+        assert_ne!(before[1], after[1], "the object was recompiled");
+        assert_eq!(
+            before[0], after[0],
+            "the identical object didn't re-archive"
+        );
+        assert_eq!(run_binary(&exe(&dir, "Release", "same")), "3\n");
+    }
+
+    #[test]
+    fn a_header_edit_recompiles_only_its_includers() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("headers");
+        write(
+            &dir.join("Yam.toml"),
+            "[project]\nname = \"headers\"\nstd = \"c++17\"\n",
+        );
+        write(
+            &dir.join("src/value.h"),
+            "inline int value() { return 1; }\n",
+        );
+        write(
+            &dir.join("src/uses.cpp"),
+            "#include \"value.h\"\nint uses() { return value(); }\n",
+        );
+        write(&dir.join("src/other.cpp"), "int other() { return 10; }\n");
+        write(
+            &dir.join("src/main.cpp"),
+            "#include <cstdio>\nint uses();\nint other();\nint main() { std::printf(\"%d\\n\", uses() + other()); }\n",
+        );
+        write(
+            &dir.join("Yam.toml"),
+            "[project]\nname = \"headers\"\nstd = \"c++17\"\n\n[[bin]]\nname = \"headers\"\nsources = [\"src/*.cpp\"]\n",
+        );
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(run_binary(&exe(&dir, "Debug", "headers")), "11\n");
+
+        write(
+            &dir.join("src/value.h"),
+            "inline int value() { return 2; }\n",
+        );
+        let before = outputs(&dir);
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(
+            rebuilt(&before, &outputs(&dir)),
+            [
+                format!("headers{}", std::env::consts::EXE_SUFFIX),
+                "obj/headers/bin/headers/src/uses.cpp.o".into()
+            ]
+        );
+        assert_eq!(run_binary(&exe(&dir, "Debug", "headers")), "12\n");
     }
 
     #[test]
