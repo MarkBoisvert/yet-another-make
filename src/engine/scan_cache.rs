@@ -1,12 +1,13 @@
 //! The persistent scan cache: each file's module dependencies from earlier builds,
 //! so only new or changed files are scanned, and a no-op build runs no scan at all.
 //!
-//! A result is keyed on `blake3(file contents)` plus a hash of everything else that
-//! affects scanning: the scanner and compiler (path and version) and the flags the
-//! file is scanned with (standard, profile flags, include directories). The key
-//! doesn't include the file's path, so identical files share an entry. Headers aren't
-//! part of the key: a header change that adds or removes an import isn't seen until
-//! header dependencies (#23) are tracked.
+//! A result is keyed on `blake3(file contents)`, the contents of the project headers
+//! the file was last compiled with ([`super::HeaderRecord`]), and a hash of everything
+//! else that affects scanning: the scanner and compiler (path and version) and the
+//! flags the file is scanned with (standard, profile flags, include directories). A
+//! header change that adds or removes an import, or flips a macro around one, is a new
+//! key. The key doesn't include the file's own path, so identical files share an
+//! entry.
 //!
 //! The cache lives in `target/<Profile>/.yam/scan-cache.json` until the binary build
 //! state file (#26) takes it over. Each build writes back only the entries it used, so
@@ -15,29 +16,38 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use super::scan::Deps;
+use super::store::{self, StoreError};
 
 /// Bumped whenever the file layout or the meaning of a key changes.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
-/// A cache key: `blake3(flags hash ‖ content hash)`.
+/// A header's path and contents hash, or `None` if it can't be read.
+pub type HeaderHash<'a> = (&'a str, Option<blake3::Hash>);
+
+/// A cache key: a hash of the flags, the file's contents and its headers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Key([u8; 32]);
 
 impl Key {
-    /// The key for a file with `contents`, scanned with flags hashed as `flags`.
+    /// The key for a file whose contents hash to `contents`, scanned with flags
+    /// hashed as `flags`, and last compiled with `headers`.
     #[must_use]
-    pub fn new(flags: &FlagsHash, contents: &[u8]) -> Self {
-        let content = blake3::hash(contents);
+    pub fn new(flags: &FlagsHash, contents: &blake3::Hash, headers: &[HeaderHash<'_>]) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(flags.0.as_bytes());
-        hasher.update(content.as_bytes());
+        hasher.update(contents.as_bytes());
+        for (path, hash) in headers {
+            hasher.update(b"\0");
+            hasher.update(path.as_bytes());
+            match hash {
+                Some(hash) => hasher.update(b"=").update(hash.as_bytes()),
+                None => hasher.update(b"!"),
+            };
+        }
         Self(*hasher.finalize().as_bytes())
     }
 
@@ -83,64 +93,30 @@ pub struct ScanCache {
     changed: bool,
 }
 
-/// Why a cache file was discarded.
-#[derive(Debug, thiserror::Error)]
-pub enum CacheError {
-    #[error("couldn't read `{}`", path.display())]
-    Read {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("`{}` is corrupt or from another yam version", path.display())]
-    Invalid { path: PathBuf },
-}
-
-#[derive(Serialize, Deserialize)]
-struct File {
-    version: u32,
-    /// Keys as hex.
-    entries: HashMap<String, Deps>,
-}
-
 impl ScanCache {
     /// Load the cache at `path`. A missing file is an empty cache. An unreadable,
     /// corrupt or outdated one is also empty, with the reason returned so the caller
     /// can say why every file is being scanned.
     #[must_use]
-    pub fn load(path: &Path) -> (Self, Option<CacheError>) {
+    pub fn load(path: &Path) -> (Self, Option<StoreError>) {
         let mut cache = Self {
             path: path.to_path_buf(),
             ..Self::default()
         };
-        let text = match fs::read(path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return (cache, None),
-            Err(source) => {
-                cache.changed = true;
-                let error = CacheError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                };
-                return (cache, Some(error));
+        match store::load::<HashMap<String, Deps>>(path, FORMAT_VERSION) {
+            Ok(entries) => {
+                cache.old = entries
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(hex, deps)| Some((Key::from_hex(&hex)?, deps)))
+                    .collect();
+                (cache, None)
             }
-        };
-        let file = serde_json::from_slice::<File>(&text)
-            .ok()
-            .filter(|file| file.version == FORMAT_VERSION);
-        let Some(file) = file else {
-            cache.changed = true;
-            let error = CacheError::Invalid {
-                path: path.to_path_buf(),
-            };
-            return (cache, Some(error));
-        };
-        cache.old = file
-            .entries
-            .into_iter()
-            .filter_map(|(hex, deps)| Some((Key::from_hex(&hex)?, deps)))
-            .collect();
-        (cache, None)
+            Err(err) => {
+                cache.changed = true;
+                (cache, Some(err))
+            }
+        }
     }
 
     /// The cached result for `key`, keeping it for the next build.
@@ -153,48 +129,33 @@ impl ScanCache {
         Some(deps)
     }
 
-    /// Record a new scan result.
+    /// Record a scan result, unless the same one is already there.
     pub fn insert(&mut self, key: Key, deps: Deps) {
-        self.used.insert(key, deps);
-        self.changed = true;
+        if self.get(key).as_ref() != Some(&deps) {
+            self.used.insert(key, deps);
+            self.changed = true;
+        }
     }
 
-    /// [`Self::save`], unless this build used exactly what was loaded, so a no-op
-    /// build writes nothing.
+    /// Write the entries this build used, unless that's exactly what was loaded, so
+    /// a no-op build writes nothing.
     ///
     /// # Errors
     ///
     /// Fails if the directory or file can't be written.
-    pub fn save_if_changed(&self) -> io::Result<()> {
-        if self.changed || !self.old.is_empty() {
-            self.save()
-        } else {
-            Ok(())
+    pub fn save_if_changed(&mut self) -> io::Result<()> {
+        if !self.changed && self.old.is_empty() {
+            return Ok(());
         }
-    }
-
-    /// Write the entries this build used, replacing the file atomically: an
-    /// interrupted write leaves the old cache, never half of a new one.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the directory or file can't be written.
-    pub fn save(&self) -> io::Result<()> {
-        let file = File {
-            version: FORMAT_VERSION,
-            entries: self
-                .used
-                .iter()
-                .map(|(key, deps)| (key.to_hex(), deps.clone()))
-                .collect(),
-        };
-        let json = serde_json::to_vec(&file).map_err(io::Error::other)?;
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let temp = self.path.with_extension("json.tmp");
-        fs::write(&temp, json)?;
-        fs::rename(&temp, &self.path)
+        let entries: HashMap<String, &Deps> = self
+            .used
+            .iter()
+            .map(|(key, deps)| (key.to_hex(), deps))
+            .collect();
+        store::save(&self.path, FORMAT_VERSION, &entries)?;
+        self.old.clear();
+        self.changed = false;
+        Ok(())
     }
 }
 
@@ -202,6 +163,7 @@ impl ScanCache {
 mod tests {
     use super::*;
     use crate::engine::scan::Provided;
+    use std::fs;
 
     fn deps(name: &str) -> Deps {
         Deps {
@@ -217,65 +179,86 @@ mod tests {
         FlagsHash::new("clang-scan-deps 23.1.6", args.iter().map(OsStr::new))
     }
 
+    fn key(contents: &[u8]) -> Key {
+        Key::new(&flags(&[]), &blake3::hash(contents), &[])
+    }
+
     #[test]
-    fn keys_change_with_contents_and_flags() {
+    fn keys_change_with_contents_flags_and_headers() {
         let base = flags(&["clang++", "-std=c++26"]);
-        let key = Key::new(&base, b"export module a;");
-        assert_eq!(key, Key::new(&base, b"export module a;"));
-        assert_ne!(key, Key::new(&base, b"export module b;"));
+        let contents = blake3::hash(b"export module a;");
+        let key = Key::new(&base, &contents, &[]);
+        assert_eq!(key, Key::new(&base, &contents, &[]));
         assert_ne!(
             key,
-            Key::new(&flags(&["clang++", "-std=c++23"]), b"export module a;")
+            Key::new(&base, &blake3::hash(b"export module b;"), &[])
         );
-        // Argument boundaries count: `-I a` + `b` isn't `-I ab`.
+        assert_ne!(
+            key,
+            Key::new(&flags(&["clang++", "-std=c++23"]), &contents, &[])
+        );
+        // Argument boundaries count: `-Ia` + `b` isn't `-Iab`.
         assert_ne!(flags(&["-Ia", "b"]), flags(&["-Iab"]));
         assert_ne!(
             FlagsHash::new("clang-scan-deps 22.1.8", [OsStr::new("clang++")]),
             FlagsHash::new("clang-scan-deps 23.1.6", [OsStr::new("clang++")])
         );
+
+        let (v1, v2) = (blake3::hash(b"#define X 0"), blake3::hash(b"#define X 1"));
+        let with = |headers: &[HeaderHash<'_>]| Key::new(&base, &contents, headers);
+        assert_ne!(key, with(&[("src/x.h", Some(v1))]));
+        assert_ne!(
+            with(&[("src/x.h", Some(v1))]),
+            with(&[("src/x.h", Some(v2))])
+        );
+        assert_ne!(
+            with(&[("src/x.h", Some(v1))]),
+            with(&[("src/y.h", Some(v1))])
+        );
+        assert_ne!(with(&[("src/x.h", Some(v1))]), with(&[("src/x.h", None)]));
     }
 
     #[test]
     fn saves_and_loads_only_the_entries_a_build_used() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".yam/scan-cache.json");
-        let flags = flags(&["clang++"]);
-        let (a, b) = (Key::new(&flags, b"a"), Key::new(&flags, b"b"));
+        let (a, b) = (key(b"a"), key(b"b"));
 
         let (mut cache, error) = ScanCache::load(&path);
         assert!(error.is_none());
         assert_eq!(cache.get(a), None);
         cache.insert(a, deps("a"));
         cache.insert(b, deps("b"));
-        cache.save().unwrap();
+        cache.save_if_changed().unwrap();
 
         // The next build uses only `a`, so `b` is dropped when it saves.
         let (mut cache, error) = ScanCache::load(&path);
         assert!(error.is_none());
         assert_eq!(cache.get(a), Some(deps("a")));
         assert_eq!(cache.get(a), Some(deps("a")));
-        cache.save().unwrap();
+        cache.save_if_changed().unwrap();
 
         let (mut cache, _) = ScanCache::load(&path);
         assert_eq!(cache.get(a), Some(deps("a")));
         assert_eq!(cache.get(b), None);
-        assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]
     fn a_build_that_used_exactly_the_cache_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scan-cache.json");
-        let key = Key::new(&flags(&[]), b"a");
+        let a = key(b"a");
         let (mut cache, _) = ScanCache::load(&path);
         cache.save_if_changed().unwrap();
         assert!(!path.exists());
-        cache.insert(key, deps("a"));
+        cache.insert(a, deps("a"));
         cache.save_if_changed().unwrap();
         assert!(path.exists());
 
         let (mut cache, _) = ScanCache::load(&path);
-        assert_eq!(cache.get(key), Some(deps("a")));
+        assert_eq!(cache.get(a), Some(deps("a")));
+        // Re-recording the same result isn't a change either.
+        cache.insert(a, deps("a"));
         fs::remove_file(&path).unwrap();
         cache.save_if_changed().unwrap();
         assert!(!path.exists(), "an unchanged cache was rewritten");
@@ -285,14 +268,14 @@ mod tests {
     fn corrupt_or_outdated_caches_are_discarded() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scan-cache.json");
-        for text in ["not json", r#"{"version": 999, "entries": {}}"#] {
+        for text in ["not json", r#"{"version": 999, "data": {}}"#] {
             fs::write(&path, text).unwrap();
             let (mut cache, error) = ScanCache::load(&path);
             assert!(
-                matches!(error, Some(CacheError::Invalid { .. })),
+                matches!(error, Some(StoreError::Invalid { .. })),
                 "{error:?}"
             );
-            assert_eq!(cache.get(Key::new(&flags(&[]), b"x")), None);
+            assert_eq!(cache.get(key(b"x")), None);
         }
     }
 }

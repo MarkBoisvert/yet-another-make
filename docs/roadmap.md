@@ -21,7 +21,7 @@ GitHub issue `#N`.
 - **Never link LLVM.**
   - Module dependencies come from **batched `clang-scan-deps -format=p1689`**, plus a
     **persistent scan cache** keyed on file content and flags.
-  - Header dependencies come from `-MD` depfiles written during compilation.
+  - Header dependencies come from `-MMD` depfiles written during compilation.
   - A native fast-path scanner is added only if benchmarks justify it.
 - **Performance is a measured gate.** The benchmark harness lands in M1, and M2
   exits only when yam beats ninja (#28).
@@ -334,12 +334,14 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       file's scan flags (standard, profile flags, include directories), not its path.
     - Each build keeps only the entries it used; a no-op build doesn't rewrite the
       file. A corrupt or outdated cache is discarded with a `note:`.
-    - Known gap until #23: a header change that adds or removes an import isn't seen,
-      since headers aren't part of the key.
+    - #23 adds the headers each file was last compiled with to the key.
 23. **Header deps from depfiles** (engine)
-    - Compile with `-MD -MF`.
+    - Compile with `-MMD -MF`: project headers only. Toolchain headers change only
+      with the toolchain, which every key already covers by path and version.
     - Ingest depfiles into the state file after each compile, the way `.ninja_deps`
-      works.
+      works. Until #26 that's `target/<Profile>/.yam/headers.json`.
+    - The scan cache key includes the recorded headers' contents, so a header change
+      that affects imports rescans the files that include it.
 24. **Build graph + staleness** (engine)
     - Graph of modules, objects, `std.pcm` and link steps, with one `std.pcm` per
       distinct project standard that uses `import std`.

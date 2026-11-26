@@ -93,12 +93,18 @@ process.
     doesn't cover the file's path, so identical files share a result.
   - Only new or changed files are rescanned.
   - **A no-op build performs zero scans** and starts no `clang-scan-deps` process.
-  - Headers aren't part of the key, so a header change that adds or removes an
-    `import` isn't seen until header dependencies are tracked (#23).
-- **Header dependencies come from depfiles.** Each compile runs with `-MD -MF`, and
+  - The key also covers the contents of the project headers the file was last
+    compiled with (from its depfile, #23). A header change that adds or removes an
+    `import`, or flips a macro around one, rescans the files that include it.
+- **Header dependencies come from depfiles.** Each compile runs with `-MMD -MF`, and
   yam reads the depfile into the state file afterwards, the way ninja maintains
   `.ninja_deps` (#23). Headers never need scanning before a compile, because a
   file's first compile is unconditional anyway.
+  - `-MMD`, not `-MD`: only project headers are recorded. libc++ alone is over a
+    thousand headers per file, and toolchain headers change only with the toolchain,
+    whose path and version are already part of every key.
+  - Until the state file (#26), the record is `target/<Profile>/.yam/headers.json`,
+    keyed by object file. A no-op build doesn't rewrite it.
 - **A native fast-path scanner is deferred** (#29). C++20 restricts module
   declarations at the top of a file enough that, when no `#if` or macros surround
   them, yam could read them directly. That is built only if #28 shows scanning still
@@ -230,6 +236,7 @@ target/
 └── <Profile>/                # Debug | Release
     ├── .yam/
     │   ├── scan-cache.json   # scan results (#22), until the state file takes them over
+    │   ├── headers.json      # each object's project headers (#23), likewise
     │   └── state             # build state file (#26)
     ├── std/<std>/            # std.pcm + std.o per standard in use, e.g. std/c++26/
     ├── modules/<project>/    # the library's compiled module interfaces (.pcm)

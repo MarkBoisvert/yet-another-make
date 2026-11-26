@@ -8,7 +8,8 @@
 //! between builds so far. Staleness (#24) and the parallel scheduler (#25) replace
 //! most of this.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,9 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 
 use crate::cli::BuildArgs;
-use crate::engine::{self, Deps, FlagsHash, Key, Plan, STD_MODULE, ScanCache, ScanJob, SourceFile};
+use crate::engine::{
+    self, Deps, FlagsHash, HeaderRecord, Key, Plan, STD_MODULE, ScanCache, ScanJob, SourceFile,
+};
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
     report, resolve_targets, validate_tree,
@@ -114,15 +117,36 @@ pub fn run(args: &BuildArgs) -> Result<()> {
             root.display()
         ),
     );
+    let out = root.join("target").join(profile.dir_name());
     let builder = Builder {
         root: &root,
-        out: root.join("target").join(profile.dir_name()),
         project: &manifest.project.name,
         std: manifest.project.std,
         profile,
         toolchain: &toolchain,
         verbose: args.verbose,
+        caches: RefCell::new(Caches::load(&out)),
+        out,
     };
+    // Whatever the build got through is kept, even when a step fails.
+    let built = build(&builder, selected);
+    builder.caches.borrow_mut().save();
+    built?;
+
+    style::status(
+        "Finished",
+        format!(
+            "`{}` profile [{}] in {:.2}s",
+            profile.dir_name(),
+            profile.description(),
+            start.elapsed().as_secs_f64()
+        ),
+    );
+    Ok(())
+}
+
+/// Scan, order, compile, archive and link the selected targets.
+fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
     let prepared = builder.prepare(selected)?;
     let imports_std = prepared.iter().any(|p| p.plan.imports_std);
     let std_module = if imports_std {
@@ -141,17 +165,72 @@ pub fn run(args: &BuildArgs) -> Result<()> {
             }
         }
     }
-
-    style::status(
-        "Finished",
-        format!(
-            "`{}` profile [{}] in {:.2}s",
-            profile.dir_name(),
-            profile.description(),
-            start.elapsed().as_secs_f64()
-        ),
-    );
     Ok(())
+}
+
+/// What one build hands the next: scan results and the headers each object was
+/// compiled with. Loaded once, and saved at the end even if the build fails.
+struct Caches {
+    scan: ScanCache,
+    headers: HeaderRecord,
+    /// Header contents hashes for this build, so each header is read once.
+    header_hashes: HashMap<PathBuf, Option<blake3::Hash>>,
+}
+
+impl Caches {
+    fn load(out: &Path) -> Self {
+        let dir = out.join(".yam");
+        let (scan, discarded) = ScanCache::load(&dir.join("scan-cache.json"));
+        if let Some(reason) = discarded {
+            style::note(format!("{reason}; scanning every file again"));
+        }
+        let (headers, discarded) = HeaderRecord::load(&dir.join("headers.json"));
+        if let Some(reason) = discarded {
+            style::note(format!("{reason}; header dependencies start over"));
+        }
+        Self {
+            scan,
+            headers,
+            header_hashes: HashMap::new(),
+        }
+    }
+
+    /// The scan key for a file, using the headers `object` was last compiled with.
+    fn key(&mut self, root: &Path, file: &FileKey, object: &Path) -> Key {
+        let headers = self.headers.get(object).to_vec();
+        self.key_with(root, file, &headers)
+    }
+
+    /// The scan key for a file compiled with `headers`.
+    fn key_with(&mut self, root: &Path, file: &FileKey, headers: &[String]) -> Key {
+        let hashes: Vec<Option<blake3::Hash>> = headers
+            .iter()
+            .map(|header| {
+                let path = root.join(header);
+                *self.header_hashes.entry(path).or_insert_with_key(|path| {
+                    fs::read(path).ok().map(|bytes| blake3::hash(&bytes))
+                })
+            })
+            .collect();
+        let pairs: Vec<engine::HeaderHash<'_>> =
+            headers.iter().map(String::as_str).zip(hashes).collect();
+        Key::new(&file.flags, &file.contents, &pairs)
+    }
+
+    fn save(&mut self) {
+        if let Err(err) = self.scan.save_if_changed() {
+            style::warning(format!("couldn't save the scan cache: {err}"));
+        }
+        if let Err(err) = self.headers.save_if_changed() {
+            style::warning(format!("couldn't save the header record: {err}"));
+        }
+    }
+}
+
+/// What a file's scan key is made of, apart from its headers.
+struct FileKey {
+    flags: FlagsHash,
+    contents: blake3::Hash,
 }
 
 /// The targets named by `--lib`/`--bin`, or all of them. A selected bin that links
@@ -201,6 +280,8 @@ struct Selected<'t> {
 struct Prepared<'t> {
     target: &'t Target,
     files: Vec<SourceFile>,
+    /// Each file's scan key parts, in the same order as `files`.
+    keys: Vec<FileKey>,
     plan: Plan,
 }
 
@@ -304,6 +385,7 @@ struct Builder<'a> {
     profile: Profile,
     toolchain: &'a Toolchain,
     verbose: bool,
+    caches: RefCell<Caches>,
 }
 
 impl Builder<'_> {
@@ -382,18 +464,18 @@ impl Builder<'_> {
             .iter()
             .map(|s| s.target)
             .find(|t| t.kind == TargetKind::Lib);
-        let deps = self.scan(&selected, lib_target)?;
-        let mut deps = deps.into_iter();
+        let scanned = self.scan(&selected, lib_target)?;
+        let mut scanned = scanned.into_iter();
 
         let mut prepared: Vec<Prepared<'t>> = Vec::with_capacity(selected.len());
         let mut lib_modules = HashSet::new();
         let none = HashSet::new();
         for Selected { target, files } in selected {
-            let files: Vec<SourceFile> = files
+            let (files, keys): (Vec<SourceFile>, Vec<FileKey>) = files
                 .into_iter()
-                .zip(deps.by_ref())
-                .map(|(path, deps)| SourceFile { path, deps })
-                .collect();
+                .zip(scanned.by_ref())
+                .map(|(path, (deps, key))| (SourceFile { path, deps }, key))
+                .unzip();
             let available = if target.kind == TargetKind::Bin && target.links_lib {
                 &lib_modules
             } else {
@@ -414,6 +496,7 @@ impl Builder<'_> {
             let target = Prepared {
                 target,
                 files,
+                keys,
                 plan,
             };
             if target.target.kind == TargetKind::Lib {
@@ -424,10 +507,15 @@ impl Builder<'_> {
         Ok(prepared)
     }
 
-    /// Every selected file's module dependencies, in order: from the scan cache when
-    /// its contents and flags are unchanged, otherwise from one `clang-scan-deps`
-    /// run over the rest. A build where nothing changed starts no scanner at all.
-    fn scan(&self, selected: &[Selected<'_>], lib_target: Option<&Target>) -> Result<Vec<Deps>> {
+    /// Every selected file's module dependencies and scan key, in order: from the
+    /// scan cache when its contents, headers and flags are unchanged, otherwise from
+    /// one `clang-scan-deps` run over the rest. A build where nothing changed starts
+    /// no scanner at all.
+    fn scan(
+        &self,
+        selected: &[Selected<'_>],
+        lib_target: Option<&Target>,
+    ) -> Result<Vec<(Deps, FileKey)>> {
         let toolchain = self.toolchain;
         let tools = format!(
             "{} {} {} {}",
@@ -436,20 +524,15 @@ impl Builder<'_> {
             toolchain.cxx.path.display(),
             toolchain.cxx.version
         );
-        let (mut cache, discarded) =
-            ScanCache::load(&self.out.join(".yam").join("scan-cache.json"));
-        if let Some(reason) = discarded {
-            style::note(format!("{reason}; scanning every file again"));
-        }
+        let mut caches = self.caches.borrow_mut();
 
-        let mut results: Vec<Option<Deps>> = Vec::new();
+        let mut results: Vec<(Option<Deps>, FileKey)> = Vec::new();
         let mut misses = Vec::new();
         let mut jobs = Vec::new();
         for Selected { target, files } in selected {
             let (obj_dir, _) = self.target_dirs(target);
-            let include_dirs = self.include_dirs(target, lib_target);
             let mut command = self.compile_command();
-            for dir in &include_dirs {
+            for dir in self.include_dirs(target, lib_target) {
                 command.arg(format!("-I{}", dir.display()));
             }
             let flags = FlagsHash::new(
@@ -460,12 +543,17 @@ impl Builder<'_> {
                 let source = self.root.join(file);
                 let contents =
                     fs::read(&source).with_context(|| format!("failed to read `{file}`"))?;
-                let key = Key::new(&flags, &contents);
-                if let Some(deps) = cache.get(key) {
-                    results.push(Some(deps));
+                let file_key = FileKey {
+                    flags: flags.clone(),
+                    contents: blake3::hash(&contents),
+                };
+                let output = object_file(&obj_dir, file);
+                let key = caches.key(self.root, &file_key, &output);
+                if let Some(deps) = caches.scan.get(key) {
+                    results.push((Some(deps), file_key));
                     continue;
                 }
-                let output = object_path(&obj_dir, file)?;
+                create_parent(&output)?;
                 let arguments = std::iter::once(command.get_program())
                     .chain(command.get_args())
                     .map(ToOwned::to_owned)
@@ -477,7 +565,7 @@ impl Builder<'_> {
                     ])
                     .collect();
                 misses.push((results.len(), key));
-                results.push(None);
+                results.push((None, file_key));
                 jobs.push(ScanJob {
                     source,
                     output,
@@ -501,14 +589,14 @@ impl Builder<'_> {
             let database = self.out.join("scan").join("compile_commands.json");
             let fresh = engine::scan(&toolchain.scan_deps.path, &database, &jobs, self.verbose)?;
             for ((index, key), deps) in misses.into_iter().zip(fresh) {
-                cache.insert(key, deps.clone());
-                results[index] = Some(deps);
+                caches.scan.insert(key, deps.clone());
+                results[index].0 = Some(deps);
             }
         }
-        if let Err(err) = cache.save_if_changed() {
-            style::warning(format!("couldn't save the scan cache: {err}"));
-        }
-        Ok(results.into_iter().flatten().collect())
+        Ok(results
+            .into_iter()
+            .filter_map(|(deps, key)| Some((deps?, key)))
+            .collect())
     }
 
     /// A target's header search directories, absolute: its own, then the library's
@@ -589,15 +677,33 @@ impl Builder<'_> {
                     compile.args(["-x", "c++-module"]);
                 }
             }
+            let depfile = depfile_path(&object);
             compile
+                .arg("-MMD")
+                .arg("-MF")
+                .arg(&depfile)
                 .arg("-c")
                 .arg(self.root.join(source))
                 .arg("-o")
                 .arg(&object);
             self.run(&mut compile, &failure)?;
+            self.record_headers(prepared, step.file, &object, &depfile);
             objects.push(object);
         }
         Ok((objects, has_modules.then_some(module_dir)))
+    }
+
+    /// Read a compiled file's depfile into the header record, and file its scan
+    /// result under the key for those headers, so the next build finds it. A missing
+    /// or unreadable depfile records no headers.
+    fn record_headers(&self, prepared: &Prepared<'_>, file: usize, object: &Path, depfile: &Path) {
+        let source = self.root.join(&prepared.files[file].path);
+        let deps = fs::read_to_string(depfile).map_or_default(|text| engine::depfile::parse(&text));
+        let headers = engine::headers_from_depfile(deps, self.root, &source);
+        let mut caches = self.caches.borrow_mut();
+        let key = caches.key_with(self.root, &prepared.keys[file], &headers);
+        caches.scan.insert(key, prepared.files[file].deps.clone());
+        caches.headers.record(object, headers);
     }
 
     fn lib(&self, prepared: &Prepared<'_>, std: Option<&StdModule>) -> Result<Lib> {
@@ -712,13 +818,30 @@ impl Builder<'_> {
     }
 }
 
+/// `<dir>/<source>.o`.
+fn object_file(dir: &Path, source: &str) -> PathBuf {
+    dir.join(format!("{source}.o"))
+}
+
 /// `<dir>/<source>.o`, creating its directory.
 fn object_path(dir: &Path, source: &str) -> Result<PathBuf> {
-    let path = dir.join(format!("{source}.o"));
-    if let Some(parent) = path.parent() {
-        create_dir(parent)?;
-    }
+    let path = object_file(dir, source);
+    create_parent(&path)?;
     Ok(path)
+}
+
+fn create_parent(path: &Path) -> Result<()> {
+    match path.parent() {
+        Some(parent) => create_dir(parent),
+        None => Ok(()),
+    }
+}
+
+/// The depfile next to an object: `<object>.d`.
+fn depfile_path(object: &Path) -> PathBuf {
+    let mut path = object.as_os_str().to_owned();
+    path.push(".d");
+    PathBuf::from(path)
 }
 
 /// The file Clang looks for in a `-fprebuilt-module-path` directory: `m.pcm`, or
@@ -917,6 +1040,45 @@ mod tests {
         fs::write(&cache, "not json").unwrap();
         run(&build_args(&dir)).unwrap();
         assert_eq!(scanned(&dir), Some(2));
+    }
+
+    #[test]
+    fn a_header_change_rescans_the_files_that_include_it() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("flag");
+        write(&dir.join("Yam.toml"), "[project]\nname = \"flag\"\n");
+        write(&dir.join("src/config.h"), "#define USE_STD 0\n");
+        write(
+            &dir.join("src/main.cpp"),
+            "#include \"config.h\"\n#if USE_STD\nimport std;\n#endif\n#include <cstdio>\n\nint main() {\n#if USE_STD\n    std::println(\"std\");\n#else\n    std::printf(\"plain\\n\");\n#endif\n}\n",
+        );
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), Some(1));
+        assert_eq!(run_binary(&exe(&dir, "Debug", "flag")), "plain\n");
+        assert!(!dir.join("target/Debug/std").exists());
+        let record = fs::read_to_string(dir.join("target/Debug/.yam/headers.json")).unwrap();
+        assert!(record.contains("src/config.h"), "{record}");
+        assert!(
+            !record.contains("c++/v1"),
+            "toolchain headers aren't recorded: {record}"
+        );
+
+        // The source didn't change, but its header did, so it's scanned again and
+        // now needs `std.pcm`.
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), None);
+        write(&dir.join("src/config.h"), "#define USE_STD 1\n");
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), Some(1));
+        assert_eq!(run_binary(&exe(&dir, "Debug", "flag")), "std\n");
+        assert!(dir.join("target/Debug/std/c++26/std.pcm").is_file());
+
+        // And settles again.
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), None);
     }
 
     #[test]
