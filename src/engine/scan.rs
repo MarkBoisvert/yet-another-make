@@ -7,7 +7,7 @@
 //! are matched back to files by their `primary-output`, which is the entry's
 //! `output`; without that field `clang-scan-deps` leaves it empty.
 //!
-//! Each file is scanned on every build until the persistent scan cache (#22).
+//! [`super::ScanCache`] keeps the results, so only new or changed files reach this.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -30,7 +30,7 @@ pub struct ScanJob {
 }
 
 /// What a file provides and requires.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deps {
     /// The module or partition the file provides (`m`, `m:part`), if any.
     pub provides: Option<Provided>,
@@ -39,7 +39,7 @@ pub struct Deps {
     pub requires: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provided {
     pub name: String,
     /// `false` for an internal partition (`module m:part;`).

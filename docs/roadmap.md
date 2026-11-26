@@ -328,7 +328,14 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
 22. **Persistent scan cache** (engine, perf)
     - Keyed on `blake3(content)` plus a flags hash.
     - Only new or changed files are rescanned; a no-op build performs **zero** scans.
-    - Stored in `target/<Profile>/.yam/`.
+    - Stored in `target/<Profile>/.yam/`: `scan-cache.json` until the state file
+      (#26) takes it over.
+    - The flags hash covers the scanner and compiler (path and version) and the
+      file's scan flags (standard, profile flags, include directories), not its path.
+    - Each build keeps only the entries it used; a no-op build doesn't rewrite the
+      file. A corrupt or outdated cache is discarded with a `note:`.
+    - Known gap until #23: a header change that adds or removes an import isn't seen,
+      since headers aren't part of the key.
 23. **Header deps from depfiles** (engine)
     - Compile with `-MD -MF`.
     - Ingest depfiles into the state file after each compile, the way `.ninja_deps`
