@@ -54,6 +54,8 @@ fn tinyxml2_and_its_cli_build_unmodified() {
         verbose: false,
         lib: false,
         bins: Vec::new(),
+        jobs: None,
+        keep_going: false,
     })
     .unwrap();
 

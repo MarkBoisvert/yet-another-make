@@ -272,6 +272,8 @@ mod tests {
                 verbose: false,
                 lib: false,
                 bins: Vec::new(),
+                jobs: None,
+                keep_going: false,
             })
             .unwrap();
             let exe = dir.join(format!(

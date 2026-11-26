@@ -9,12 +9,13 @@
 //! nothing. The parallel scheduler (#25) runs independent nodes at the same time.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -127,6 +128,11 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         profile,
         toolchain: &toolchain,
         verbose: args.verbose,
+        jobs: args.jobs.map_or_else(
+            || std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+            |jobs| jobs as usize,
+        ),
+        keep_going: args.keep_going,
         caches: RefCell::new(Caches::load(&out)),
         out,
     };
@@ -147,8 +153,13 @@ pub fn run(args: &BuildArgs) -> Result<()> {
     Ok(())
 }
 
-/// Scan and order the selected targets, then run the build graph, skipping every
-/// node whose output is fresh.
+/// Scan and order the selected targets, then run the build graph: up to `-j` nodes
+/// at a time, each once everything it needs is done, skipping every node whose
+/// output is fresh.
+///
+/// After the first failure no new node starts, and the build fails once the running
+/// ones finish, like Cargo. With `--keep-going`, every node that doesn't depend on a
+/// failed one still runs, and every failure is reported.
 fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
     let prepared = builder.prepare(selected)?;
     let graph_targets: Vec<GraphTarget<'_>> = prepared
@@ -165,56 +176,294 @@ fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
         .iter()
         .find(|p| p.target.kind == TargetKind::Lib)
         .map(|p| builder.lib(p));
+    let std_module = nodes
+        .iter()
+        .any(|n| n.action == Action::Std)
+        .then(|| builder.std_module());
 
-    let mut std_module: Option<StdModule> = None;
+    let mut progress = Progress::new(&nodes);
     // The compiled module interfaces each node reads, directly or through the
     // modules it imports.
     let mut pcms: Vec<Vec<PathBuf>> = vec![Vec::new(); nodes.len()];
+
+    let (send, receive) = mpsc::channel::<Finished>();
+    let mut running: HashMap<usize, Finish> = HashMap::new();
+    let mut failures: Vec<String> = Vec::new();
     let (mut ran, mut compiles) = (0, 0);
-    for (id, node) in nodes.iter().enumerate() {
-        let mut reads = std::collections::BTreeSet::new();
-        for &need in &node.needs {
-            match nodes[need].action {
-                Action::Std => {
-                    if let Some(std) = &std_module {
-                        reads.insert(std.pcm.clone());
-                    }
+
+    loop {
+        // After a failure, start nothing new unless keeping going.
+        while running.len() < builder.jobs && (failures.is_empty() || builder.keep_going) {
+            let Some(id) = progress.next() else {
+                break;
+            };
+            pcms[id] = reads(&nodes, id, &pcms, &prepared, builder, std_module.as_ref());
+            let context = NodeContext {
+                prepared: &prepared,
+                lib: lib.as_ref(),
+                std: std_module.as_ref(),
+                pcms: &pcms[id],
+            };
+            if matches!(nodes[id].action, Action::Compile { .. }) {
+                compiles += 1;
+            }
+            match builder.job(nodes[id].action, &context) {
+                Ok(None) => progress.done(id),
+                Ok(Some(job)) => {
+                    running.insert(id, spawn(id, job, &send, builder.verbose));
                 }
-                Action::Compile { target, step } => {
-                    if let Some(pcm) = builder.pcm_path(&prepared[target], step) {
-                        reads.insert(pcm);
-                    }
-                    reads.extend(pcms[need].iter().cloned());
-                }
-                Action::Archive { .. } | Action::Link { .. } => {}
+                Err(err) => failures.push(format!("{err:#}")),
             }
         }
-        pcms[id] = reads.into_iter().collect();
+        if running.is_empty() {
+            break;
+        }
 
-        match node.action {
-            Action::Std => std_module = Some(builder.std_module()?),
-            Action::Compile { target, step } => {
-                let prepared = &prepared[target];
-                let lib = lib.as_ref().filter(|_| {
-                    prepared.target.kind == TargetKind::Bin && prepared.target.links_lib
-                });
-                compiles += 1;
-                if builder.compile(prepared, step, std_module.as_ref(), lib, &pcms[id])? {
-                    ran += 1;
-                }
+        let Finished {
+            node,
+            output,
+            error,
+        } = receive
+            .recv()
+            .context("a build job stopped without reporting back")?;
+        let finish = running
+            .remove(&node)
+            .context("a build job reported back twice")?;
+        print_output(&output);
+        let result = match error {
+            Some(error) => Err(anyhow::anyhow!(error)),
+            None => builder.finish(finish, &prepared),
+        };
+        match result {
+            Ok(was_compile) => {
+                ran += usize::from(was_compile);
+                progress.done(node);
             }
-            Action::Archive { target } => builder.archive(&prepared[target])?,
-            Action::Link { target } => {
-                let prepared = &prepared[target];
-                let lib = lib.as_ref().filter(|_| prepared.target.links_lib);
-                builder.link(prepared, std_module.as_ref(), lib)?;
+            Err(err) => {
+                if failures.is_empty() && !builder.keep_going && !running.is_empty() {
+                    style::warning("build failed, waiting for other jobs to finish...");
+                }
+                failures.push(format!("{err:#}"));
             }
         }
     }
+
     if builder.verbose {
         style::status("Compiled", format!("{ran} of {compiles} files"));
     }
-    Ok(())
+    // Each distinct failure once, with a count when a target's files failed more
+    // than once. All but the last are printed here; the last becomes the error.
+    let mut summary = failure_summary(failures);
+    let last = summary.pop();
+    for failure in &summary {
+        style::error(failure);
+    }
+    match last {
+        Some(last) => bail!("{last}"),
+        None => Ok(()),
+    }
+}
+
+/// Failures in the order they happened, each message once: ``could not compile `app`
+/// (bin): 2 files failed`` when two of its files did.
+fn failure_summary(failures: Vec<String>) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for failure in failures {
+        match counts.iter_mut().find(|(message, _)| *message == failure) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((failure, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(message, count)| match count {
+            1 => message,
+            n => format!("{message}: {n} files failed"),
+        })
+        .collect()
+}
+
+/// Which nodes are ready to run: every node they need is done.
+struct Progress {
+    /// How many of its needs each node still waits for.
+    waiting: Vec<usize>,
+    /// The nodes that need each node.
+    dependents: Vec<Vec<usize>>,
+    /// Ready nodes, lowest first: the graph's order puts module interfaces, which
+    /// unblock the most, early.
+    ready: BTreeSet<usize>,
+}
+
+impl Progress {
+    fn new(nodes: &[engine::Node]) -> Self {
+        let waiting: Vec<usize> = nodes.iter().map(|n| n.needs.len()).collect();
+        let mut dependents = vec![Vec::new(); nodes.len()];
+        for (id, node) in nodes.iter().enumerate() {
+            for &need in &node.needs {
+                dependents[need].push(id);
+            }
+        }
+        let ready = (0..nodes.len()).filter(|&id| waiting[id] == 0).collect();
+        Self {
+            waiting,
+            dependents,
+            ready,
+        }
+    }
+
+    fn next(&mut self) -> Option<usize> {
+        self.ready.pop_first()
+    }
+
+    /// Node `id` is done; whatever was waiting only on it is now ready. A failed node
+    /// is never marked done, so nothing downstream of it ever runs.
+    fn done(&mut self, id: usize) {
+        for &dependent in &self.dependents[id] {
+            self.waiting[dependent] -= 1;
+            if self.waiting[dependent] == 0 {
+                self.ready.insert(dependent);
+            }
+        }
+    }
+}
+
+/// Start `job` on a worker thread, which reports back on `send`. Returns what to
+/// record once it succeeds.
+fn spawn(id: usize, job: Job, send: &mpsc::Sender<Finished>, verbose: bool) -> Finish {
+    if verbose {
+        for command in &job.commands {
+            style::status("Running", format!("`{}`", display(command)));
+        }
+    }
+    let send = send.clone();
+    let (commands, failure) = (job.commands, job.failure);
+    std::thread::spawn(move || {
+        let _ = send.send(run_commands(id, commands, &failure));
+    });
+    job.finish
+}
+
+/// The compiled interfaces node `id` reads: those of the nodes it needs, and what
+/// they read in turn. Each need's list is already known, since it ran first.
+fn reads(
+    nodes: &[engine::Node],
+    id: usize,
+    pcms: &[Vec<PathBuf>],
+    prepared: &[Prepared<'_>],
+    builder: &Builder<'_>,
+    std: Option<&StdModule>,
+) -> Vec<PathBuf> {
+    let mut reads = BTreeSet::new();
+    for &need in &nodes[id].needs {
+        match nodes[need].action {
+            Action::Std => reads.extend(std.map(|std| std.pcm.clone())),
+            Action::Compile { target, step } => {
+                reads.extend(builder.pcm_path(&prepared[target], step));
+                reads.extend(pcms[need].iter().cloned());
+            }
+            Action::Archive { .. } | Action::Link { .. } => {}
+        }
+    }
+    reads.into_iter().collect()
+}
+
+/// What a node's job needs to know beyond the node itself.
+struct NodeContext<'a, 't> {
+    prepared: &'a [Prepared<'t>],
+    lib: Option<&'a Lib>,
+    std: Option<&'a StdModule>,
+    /// The compiled interfaces this node reads.
+    pcms: &'a [PathBuf],
+}
+
+/// A node's commands, run in order on a worker thread, and how the build records
+/// their result.
+struct Job {
+    commands: Vec<Command>,
+    /// The error if a command fails, e.g. ``could not compile `app` (bin)``.
+    failure: String,
+    finish: Finish,
+}
+
+/// What the build records once a job's commands succeed.
+enum Finish {
+    Std {
+        stamp_path: PathBuf,
+        stamp: String,
+    },
+    Compile {
+        target: usize,
+        file: usize,
+        source: PathBuf,
+        object: PathBuf,
+        pcm: Option<PathBuf>,
+        depfile: PathBuf,
+        pcms: Vec<PathBuf>,
+        command: CommandHash,
+    },
+    Output {
+        output: PathBuf,
+        command: CommandHash,
+        inputs: Vec<PathBuf>,
+    },
+}
+
+/// A job's result, sent back from its worker thread.
+struct Finished {
+    node: usize,
+    /// Each command's captured stdout and stderr, in order.
+    output: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Why it failed, if it did.
+    error: Option<String>,
+}
+
+/// Run `commands` in order, capturing their output, stopping at the first failure.
+fn run_commands(node: usize, commands: Vec<Command>, failure: &str) -> Finished {
+    let mut output = Vec::with_capacity(commands.len());
+    for mut command in commands {
+        match command.output() {
+            Ok(result) => {
+                let ok = result.status.success();
+                output.push((result.stdout, result.stderr));
+                if !ok {
+                    return Finished {
+                        node,
+                        output,
+                        error: Some(failure.to_string()),
+                    };
+                }
+            }
+            Err(err) => {
+                return Finished {
+                    node,
+                    output,
+                    error: Some(format!(
+                        "{failure}: couldn't run `{}`: {err}",
+                        display(&command)
+                    )),
+                };
+            }
+        }
+    }
+    Finished {
+        node,
+        output,
+        error: None,
+    }
+}
+
+/// Print a finished job's output as one block. Colors in it are kept on a terminal
+/// and stripped otherwise, following `--color`.
+fn print_output(output: &[(Vec<u8>, Vec<u8>)]) {
+    use std::io::Write as _;
+    for (stdout, stderr) in output {
+        if !stdout.is_empty() {
+            let _ = anstream::stdout().write_all(stdout);
+        }
+        if !stderr.is_empty() {
+            let _ = anstream::stderr().write_all(stderr);
+        }
+    }
 }
 
 /// What one build hands the next: scan results and the headers each object was
@@ -443,6 +692,10 @@ struct Builder<'a> {
     profile: Profile,
     toolchain: &'a Toolchain,
     verbose: bool,
+    /// How many jobs run at once.
+    jobs: usize,
+    /// Whether to keep going after a failure.
+    keep_going: bool,
     caches: RefCell<Caches>,
 }
 
@@ -457,16 +710,19 @@ impl Builder<'_> {
         command
     }
 
-    /// Build `std.pcm` and `std.o` into `std/<std>/`, unless the last build left them
-    /// there from the same compiler, commands and `std.cppm`.
-    fn std_module(&self) -> Result<StdModule> {
+    /// Where `std.pcm` and `std.o` go: `std/<std>/`.
+    fn std_module(&self) -> StdModule {
         let dir = self.out.join("std").join(self.std.as_str());
-        let module = StdModule {
+        StdModule {
             pcm: dir.join("std.pcm"),
             object: dir.join("std.o"),
-        };
-        let std = &self.toolchain.std_modules.std;
+        }
+    }
 
+    /// Build `std.pcm` and `std.o`, unless the last build left them there from the
+    /// same compiler, commands and `std.cppm`.
+    fn std_job(&self, module: &StdModule) -> Result<Option<Job>> {
+        let std = &self.toolchain.std_modules.std;
         let mut precompile = self.compile_command();
         precompile.arg("-Wno-reserved-module-identifier");
         for include in &std.system_include_dirs {
@@ -487,8 +743,9 @@ impl Builder<'_> {
             .arg("-o")
             .arg(&module.object);
 
-        // Until the build state file (#24, #26), a stamp next to the outputs records
-        // what they were built from.
+        // Until the build state file (#26), a stamp next to the outputs records what
+        // they were built from.
+        let dir = module.pcm.parent().unwrap_or(&self.out).to_path_buf();
         let stamp_path = dir.join("std.stamp");
         let stamp = [
             identity(&self.toolchain.cxx.path),
@@ -502,17 +759,81 @@ impl Builder<'_> {
             && module.object.is_file()
             && fs::read_to_string(&stamp_path).is_ok_and(|old| old == stamp);
         if fresh {
-            return Ok(module);
+            return Ok(None);
         }
 
         create_dir(&dir)?;
         // Remove the stamp first so an interrupted build can't look fresh.
         let _ = fs::remove_file(&stamp_path);
-        self.run(&mut precompile, "failed to build the `std` module")?;
-        self.run(&mut compile, "failed to build the `std` module")?;
-        fs::write(&stamp_path, stamp)
-            .with_context(|| format!("failed to write `{}`", stamp_path.display()))?;
-        Ok(module)
+        Ok(Some(Job {
+            commands: vec![precompile, compile],
+            failure: "failed to build the `std` module".into(),
+            finish: Finish::Std { stamp_path, stamp },
+        }))
+    }
+
+    /// The job for a node, or `None` if its outputs are fresh.
+    fn job(&self, action: Action, context: &NodeContext<'_, '_>) -> Result<Option<Job>> {
+        match action {
+            Action::Std => match context.std {
+                Some(module) => self.std_job(module),
+                None => Ok(None),
+            },
+            Action::Compile { target, step } => {
+                let prepared = &context.prepared[target];
+                let lib = context.lib.filter(|_| {
+                    prepared.target.kind == TargetKind::Bin && prepared.target.links_lib
+                });
+                self.compile_job(target, prepared, step, context.std, lib, context.pcms)
+            }
+            Action::Archive { target } => self.archive_job(&context.prepared[target]),
+            Action::Link { target } => {
+                let prepared = &context.prepared[target];
+                let lib = context.lib.filter(|_| prepared.target.links_lib);
+                self.link_job(prepared, context.std, lib)
+            }
+        }
+    }
+
+    /// Record a job that succeeded. Returns whether it was a compile.
+    fn finish(&self, finish: Finish, prepared: &[Prepared<'_>]) -> Result<bool> {
+        match finish {
+            Finish::Std { stamp_path, stamp } => {
+                fs::write(&stamp_path, stamp)
+                    .with_context(|| format!("failed to write `{}`", stamp_path.display()))?;
+                Ok(false)
+            }
+            Finish::Compile {
+                target,
+                file,
+                source,
+                object,
+                pcm,
+                depfile,
+                pcms,
+                command,
+            } => {
+                let headers = self.record_headers(&prepared[target], file, &object, &depfile);
+                let inputs = self.compile_inputs(&source, &headers, &pcms);
+                let mut caches = self.caches.borrow_mut();
+                caches.outputs.record(&object, command, &inputs);
+                caches.outputs.invalidate(&object);
+                if let Some(pcm) = &pcm {
+                    caches.outputs.invalidate(pcm);
+                }
+                Ok(true)
+            }
+            Finish::Output {
+                output,
+                command,
+                inputs,
+            } => {
+                let mut caches = self.caches.borrow_mut();
+                caches.outputs.record(&output, command, &inputs);
+                caches.outputs.invalidate(&output);
+                Ok(false)
+            }
+        }
     }
 
     /// Scan every selected file in one `clang-scan-deps` call, then order each
@@ -707,16 +1028,17 @@ impl Builder<'_> {
         Some(module_dir.join(pcm_name(module)))
     }
 
-    /// Compile one file, unless its object (and interface) are fresh. `pcms` are the
-    /// compiled interfaces it reads. Returns whether it ran.
-    fn compile(
+    /// The job compiling one file, unless its object (and interface) are fresh.
+    /// `pcms` are the compiled interfaces it reads.
+    fn compile_job(
         &self,
+        target_index: usize,
         prepared: &Prepared<'_>,
         step: usize,
         std: Option<&StdModule>,
         lib: Option<&Lib>,
         pcms: &[PathBuf],
-    ) -> Result<bool> {
+    ) -> Result<Option<Job>> {
         let target = prepared.target;
         let (_, module_dir) = self.target_dirs(target);
         let file = prepared.plan.steps[step].file;
@@ -757,7 +1079,10 @@ impl Builder<'_> {
                 compile.args(["-x", "c++-module"]);
             }
         }
+        // The output is captured, so colors are asked for explicitly; printing it
+        // strips them again when they aren't wanted.
         compile
+            .arg("-fdiagnostics-color=always")
             .arg("-MMD")
             .arg("-MF")
             .arg(&depfile)
@@ -775,23 +1100,27 @@ impl Builder<'_> {
             .outputs
             .is_fresh(&object, command, &inputs);
         if fresh && pcm.as_ref().is_none_or(|pcm| pcm.exists()) {
-            return Ok(false);
+            return Ok(None);
         }
 
         create_parent(&object)?;
         if let Some(pcm) = &pcm {
             create_parent(pcm)?;
         }
-        self.run(&mut compile, &could_not("compile", target))?;
-        let headers = self.record_headers(prepared, file, &object, &depfile);
-        let inputs = self.compile_inputs(&source, &headers, pcms);
-        let mut caches = self.caches.borrow_mut();
-        caches.outputs.record(&object, command, &inputs);
-        caches.outputs.invalidate(&object);
-        if let Some(pcm) = &pcm {
-            caches.outputs.invalidate(pcm);
-        }
-        Ok(true)
+        Ok(Some(Job {
+            commands: vec![compile],
+            failure: could_not("compile", target),
+            finish: Finish::Compile {
+                target: target_index,
+                file,
+                source,
+                object,
+                pcm,
+                depfile,
+                pcms: pcms.to_vec(),
+                command,
+            },
+        }))
     }
 
     /// What a compile reads: the source, its project headers and the compiled
@@ -848,8 +1177,8 @@ impl Builder<'_> {
             .collect()
     }
 
-    /// Archive the library's objects, unless the archive is fresh.
-    fn archive(&self, prepared: &Prepared<'_>) -> Result<()> {
+    /// The job archiving the library's objects, unless the archive is fresh.
+    fn archive_job(&self, prepared: &Prepared<'_>) -> Result<Option<Job>> {
         let target = prepared.target;
         let objects = self.objects(prepared);
         let archive = self.out.join(format!("lib{}.a", target.name));
@@ -867,27 +1196,31 @@ impl Builder<'_> {
             .outputs
             .is_fresh(&archive, command, &objects)
         {
-            return Ok(());
+            return Ok(None);
         }
 
         let _ = fs::remove_file(&archive);
         let mut ar = Command::new(&self.toolchain.ar);
         ar.args(&before);
         self.add_files(&mut ar, &objects, &format!("lib{}.a", target.name))?;
-        self.run(&mut ar, &could_not("archive", target))?;
-        let mut caches = self.caches.borrow_mut();
-        caches.outputs.record(&archive, command, &objects);
-        caches.outputs.invalidate(&archive);
-        Ok(())
+        Ok(Some(Job {
+            commands: vec![ar],
+            failure: could_not("archive", target),
+            finish: Finish::Output {
+                output: archive,
+                command,
+                inputs: objects,
+            },
+        }))
     }
 
-    /// Link a bin, unless its executable is fresh.
-    fn link(
+    /// The job linking a bin, unless its executable is fresh.
+    fn link_job(
         &self,
         prepared: &Prepared<'_>,
         std: Option<&StdModule>,
         lib: Option<&Lib>,
-    ) -> Result<()> {
+    ) -> Result<Option<Job>> {
         let target = prepared.target;
         let mut objects = self.objects(prepared);
         if let Some(std) = std {
@@ -948,18 +1281,22 @@ impl Builder<'_> {
             .outputs
             .is_fresh(&executable, command, &inputs)
         {
-            return Ok(());
+            return Ok(None);
         }
 
         let mut link = Command::new(&self.toolchain.cxx.path);
         link.arg(&before);
         self.add_files(&mut link, &objects, &target.name)?;
         link.args(&after);
-        self.run(&mut link, &could_not("link", target))?;
-        let mut caches = self.caches.borrow_mut();
-        caches.outputs.record(&executable, command, &inputs);
-        caches.outputs.invalidate(&executable);
-        Ok(())
+        Ok(Some(Job {
+            commands: vec![link],
+            failure: could_not("link", target),
+            finish: Finish::Output {
+                output: executable,
+                command,
+                inputs,
+            },
+        }))
     }
 
     /// Add `files` to `command`, through a response file in `rsp/<name>.rsp` when the
@@ -980,20 +1317,6 @@ impl Builder<'_> {
         }
         fs::write(&path, text).with_context(|| format!("failed to write `{}`", path.display()))?;
         command.arg(format!("@{}", path.display()));
-        Ok(())
-    }
-
-    /// Run `command`, echoing it with `-v`. Its output goes straight to the terminal.
-    fn run(&self, command: &mut Command, failure: &str) -> Result<()> {
-        if self.verbose {
-            style::status("Running", format!("`{}`", display(command)));
-        }
-        let status = command
-            .status()
-            .with_context(|| format!("{failure}: couldn't run `{}`", display(command)))?;
-        if !status.success() {
-            bail!("{failure}");
-        }
         Ok(())
     }
 }
@@ -1101,6 +1424,8 @@ mod tests {
             verbose: true,
             lib: false,
             bins: Vec::new(),
+            jobs: None,
+            keep_going: false,
         }
     }
 
@@ -1669,6 +1994,98 @@ mod tests {
         assert!(!dir.join("target/Debug/std").exists());
     }
 
+    /// A bin whose sources are, in compile order: a broken file, two good ones, and
+    /// another broken one.
+    fn two_broken_files(dir: &Path) {
+        write(
+            &dir.join("Yam.toml"),
+            "[project]\nname = \"app\"\nstd = \"c++17\"\n\n[[bin]]\nname = \"app\"\nsources = [\"src/*.cpp\"]\n",
+        );
+        write(&dir.join("src/a_bad.cpp"), "int a() { return nope; }\n");
+        write(&dir.join("src/b.cpp"), "int b() { return 2; }\n");
+        write(&dir.join("src/main.cpp"), "int main() {}\n");
+        write(&dir.join("src/z_bad.cpp"), "int z() { return nope; }\n");
+    }
+
+    fn object(dir: &Path, file: &str) -> PathBuf {
+        dir.join("target/Debug/obj/app/bin/app/src")
+            .join(format!("{file}.o"))
+    }
+
+    #[test]
+    fn the_first_failure_stops_new_jobs() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("app");
+        two_broken_files(&dir);
+        let mut args = build_args(&dir);
+        args.jobs = Some(1);
+        let err = run(&args).unwrap_err().to_string();
+        assert_eq!(err, "could not compile `app` (bin)");
+        // One job at a time, in order: nothing after `a_bad.cpp` started.
+        assert!(!object(&dir, "b.cpp").exists());
+        assert!(!object(&dir, "main.cpp").exists());
+    }
+
+    #[test]
+    fn keep_going_builds_everything_it_can() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("app");
+        two_broken_files(&dir);
+        let mut args = build_args(&dir);
+        args.jobs = Some(1);
+        args.keep_going = true;
+        let err = run(&args).unwrap_err().to_string();
+        assert_eq!(err, "could not compile `app` (bin): 2 files failed");
+        assert!(object(&dir, "b.cpp").exists());
+        assert!(object(&dir, "main.cpp").exists());
+        // The link needs the broken objects, so it never ran.
+        assert!(!exe(&dir, "Debug", "app").exists());
+
+        // Fixing both files rebuilds only them, then links.
+        let good = fs::metadata(object(&dir, "b.cpp"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        write(&dir.join("src/a_bad.cpp"), "int a() { return 1; }\n");
+        write(&dir.join("src/z_bad.cpp"), "int z() { return 26; }\n");
+        run(&args).unwrap();
+        assert!(exe(&dir, "Debug", "app").exists());
+        assert_eq!(
+            fs::metadata(object(&dir, "b.cpp"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            good
+        );
+    }
+
+    #[test]
+    fn parallel_and_serial_builds_agree() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("calc");
+        new_project(&dir, true, false);
+        write(
+            &dir.join("src/main.cpp"),
+            "import std;\nimport calc;\n\nint main() {\n    std::println(\"{}\", calc::add(40, 2));\n}\n",
+        );
+        for jobs in [1, 8] {
+            let _ = fs::remove_dir_all(dir.join("target"));
+            let mut args = build_args(&dir);
+            args.jobs = Some(jobs);
+            run(&args).unwrap();
+            assert_eq!(run_binary(&exe(&dir, "Debug", "calc")), "42\n", "-j {jobs}");
+        }
+    }
+
     #[test]
     fn compile_errors_name_the_target() {
         if !have_toolchain() {
@@ -1820,6 +2237,22 @@ mod tests {
         args.lib = true;
         let err = select(vec![target("app", TargetKind::Bin, false)], &args).unwrap_err();
         assert_eq!(err.to_string(), "no library target in this project");
+    }
+
+    #[test]
+    fn repeated_failures_are_counted_once() {
+        let summary = failure_summary(vec![
+            "could not compile `app` (bin)".into(),
+            "could not compile `core` (lib)".into(),
+            "could not compile `app` (bin)".into(),
+        ]);
+        assert_eq!(
+            summary,
+            [
+                "could not compile `app` (bin): 2 files failed",
+                "could not compile `core` (lib)"
+            ]
+        );
     }
 
     #[test]

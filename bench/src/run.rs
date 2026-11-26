@@ -238,7 +238,7 @@ fn build_command(tool: Tool, dir: &Path, build: &Path, plan: &Plan) -> String {
         Tool::CmakeBuild => join(&["cmake", "--build", &path(build), "--parallel", &jobs]),
         Tool::Yam => {
             let yam = plan.yam.as_deref().map_or_default(path);
-            join(&[&yam, "build", &path(dir)])
+            join(&[&yam, "build", "-j", &jobs, &path(dir)])
         }
     }
 }

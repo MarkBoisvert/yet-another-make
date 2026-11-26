@@ -115,6 +115,9 @@ pub struct InitArgs {
     pub vcs: Option<Vcs>,
 }
 
+// Each bool is an independent command-line flag, as clap models them; an enum
+// wouldn't fit flags that combine freely.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Args)]
 pub struct BuildArgs {
     /// Path to the project to build
@@ -136,6 +139,15 @@ pub struct BuildArgs {
     /// Build only the named binary (repeatable)
     #[arg(long = "bin", value_name = "NAME")]
     pub bins: Vec<String>,
+
+    /// Number of parallel jobs (default: the number of CPUs)
+    #[arg(short, long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub jobs: Option<u32>,
+
+    /// Keep building whatever doesn't depend on a failed step, instead of stopping
+    /// after the first failure
+    #[arg(long)]
+    pub keep_going: bool,
 }
 
 #[derive(Args)]
