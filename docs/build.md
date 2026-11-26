@@ -53,9 +53,9 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
 4. **Compute each project's standard** (see
    [One standard per project](#one-standard-per-project--decided)).
 5. **Ensure a `std.pcm`** for each distinct standard in use (see [std.pcm](#stdpcm--decided)).
-6. **Scan** new and changed files for module provides/requires (#21, #22). Until
-   #21, yam reads each file's module declaration and imports from its text and
-   orders a target's interfaces by them (`src/engine/`).
+6. **Scan** new and changed files for module provides/requires (#21, #22). One
+   `clang-scan-deps -format=p1689` call covers every file (`src/engine/scan.rs`);
+   until #22 every file is scanned on every build.
 7. **Build the graph** of module interfaces, objects, `std.pcm` and link steps (#24).
 8. **Decide staleness** for each node (#24).
 9. **Schedule** stale nodes in parallel, in dependency order (#25).
@@ -78,6 +78,14 @@ process.
   build** over a generated compilation database that covers every file needing a
   scan. Batching pays the process start-up cost once and lets `clang-scan-deps` share
   its own internal file cache across files (#21).
+  - Each database entry carries the file's compile flags and its object file as
+    `output`. P1689 reports that as the rule's `primary-output`, which is how rules
+    are matched back to files; without `output` it's empty, and the rules come back
+    in completion order.
+  - A failed scan fails the build with the scanner's diagnostics, for example on a
+    header-unit import, which yam doesn't support.
+  - Whether a bin's file defines `main()` isn't a module dependency, so yam reads that
+    from the text (`src/engine/entry.rs`).
 - **The scan cache persists between builds** (#22).
   - Each file's P1689 result is keyed on `blake3(file contents)` plus a hash of the
     flags that affect scanning (the project's standard, defines, include dirs, triplet).
@@ -225,6 +233,7 @@ target/
     │   ├── lib/              # the library's objects and depfiles, mirroring source paths
     │   └── bin/<bin>/        # each bin's objects, so bins may share a source file
     ├── rsp/                  # response files for long archive and link commands
+    ├── scan/                 # the compilation database for clang-scan-deps (#21)
     ├── <bin>                 # the root project's linked executables
     └── lib<name>.a           # project libraries
 ```

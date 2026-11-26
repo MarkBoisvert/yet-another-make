@@ -321,6 +321,10 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - One `clang-scan-deps -format=p1689` call per build, over a generated compilation
       database.
     - Parse P1689 into provides/requires edges.
+    - Each entry's `output` is the file's object, which P1689 reports as
+      `primary-output`; that's how rules are matched to files.
+    - Replaces #20's textual import reader. A failed scan (for example a header-unit
+      import) fails the build with the scanner's diagnostics.
 22. **Persistent scan cache** (engine, perf)
     - Keyed on `blake3(content)` plus a flags hash.
     - Only new or changed files are rescanned; a no-op build performs **zero** scans.

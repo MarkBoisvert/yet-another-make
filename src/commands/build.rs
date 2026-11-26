@@ -1,10 +1,11 @@
 //! `yam build`: compile every file of the project's lib and bins, archive the lib and
 //! link the bins.
 //!
-//! Every file is compiled on every build, one at a time, in the order
-//! [`engine::plan`] gives. Only `std.pcm` is reused between builds so far. Batched
-//! scanning (#21), staleness (#24) and the parallel scheduler (#25) replace most of
-//! this.
+//! One batched `clang-scan-deps` call finds every file's module dependencies
+//! ([`engine::scan`]), and each target's files are compiled in the order
+//! [`engine::plan`] gives. Every file is scanned and compiled on every build, one
+//! compile at a time; only `std.pcm` is reused between builds so far. The scan cache
+//! (#22), staleness (#24) and the parallel scheduler (#25) replace most of this.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -16,7 +17,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 
 use crate::cli::BuildArgs;
-use crate::engine::{self, Import, Plan, STD_MODULE, Scan, SourceFile};
+use crate::engine::{self, Plan, STD_MODULE, ScanJob, SourceFile};
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
     report, resolve_targets, validate_tree,
@@ -68,8 +69,8 @@ impl Profile {
 /// # Errors
 ///
 /// Fails if the manifest is invalid, a selected target doesn't exist or has no source
-/// files, its modules can't be ordered, the toolchain can't be found, or a compile,
-/// archive or link step fails.
+/// files, a bin has two `main()`s, the toolchain can't be found, scanning fails, a
+/// target's modules can't be ordered, or a compile, archive or link step fails.
 pub fn run(args: &BuildArgs) -> Result<()> {
     let start = Instant::now();
     let root = args
@@ -94,9 +95,7 @@ pub fn run(args: &BuildArgs) -> Result<()> {
     }
 
     let targets = select(resolve_targets(&manifest, &root)?, args)?;
-    let std = manifest.project.std;
-    let prepared = prepare(&root, &targets, &tree, std)?;
-    let imports_std = prepared.iter().any(|p| p.plan.imports_std);
+    let selected = select_files(&root, &targets, &tree)?;
 
     let profile = if args.release {
         Profile::Release
@@ -118,11 +117,13 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         root: &root,
         out: root.join("target").join(profile.dir_name()),
         project: &manifest.project.name,
-        std,
+        std: manifest.project.std,
         profile,
         toolchain: &toolchain,
         verbose: args.verbose,
     };
+    let prepared = builder.prepare(selected)?;
+    let imports_std = prepared.iter().any(|p| p.plan.imports_std);
     let std_module = if imports_std {
         Some(builder.std_module()?)
     } else {
@@ -189,7 +190,13 @@ fn select(targets: Vec<Target>, args: &BuildArgs) -> Result<Vec<Target>> {
         .collect())
 }
 
-/// A target with its files read and put in compile order.
+/// A target and the files it compiles, relative to the root and sorted.
+struct Selected<'t> {
+    target: &'t Target,
+    files: Vec<String>,
+}
+
+/// A target with its files scanned and put in compile order.
 struct Prepared<'t> {
     target: &'t Target,
     files: Vec<SourceFile>,
@@ -207,56 +214,34 @@ impl Prepared<'_> {
     }
 }
 
-/// Read and order every target's files. Needs no toolchain, so a project's mistakes
-/// are reported before any compiler runs.
-fn prepare<'t>(
+/// Every target's files, checking what can be checked without a toolchain: each
+/// target has a source file, and each bin has one `main()`.
+fn select_files<'t>(
     root: &Path,
     targets: &'t [Target],
     tree: &SourceTree,
-    std: CppStd,
-) -> Result<Vec<Prepared<'t>>> {
-    let mut prepared: Vec<Prepared<'t>> = Vec::with_capacity(targets.len());
-    let mut lib_modules = HashSet::new();
-    let none = HashSet::new();
+) -> Result<Vec<Selected<'t>>> {
+    let mut selected = Vec::with_capacity(targets.len());
     for target in targets {
-        let files = source_files(root, target, tree)?;
-        let available = if target.kind == TargetKind::Bin && target.links_lib {
-            &lib_modules
-        } else {
-            &none
-        };
-        let plan = engine::plan(
-            &describe(target),
-            &files,
-            target.kind == TargetKind::Bin,
-            available,
-        )?;
-        if plan.imports_std && !std.supports_import_std() {
-            let file = files
-                .iter()
-                .find(|f| f.scan.imports.contains(&Import::Module(STD_MODULE.into())))
-                .map_or("", |f| f.path.as_str());
-            bail!(
-                "`{file}` imports `std`, which needs c++23 or later, but the project's \
-                 std is {}\n\nhelp: set `std = \"c++23\"` or later in [project]",
-                std.as_str()
-            );
+        let files = source_files(target, tree)?;
+        if target.kind == TargetKind::Bin {
+            let mut mains = Vec::new();
+            for file in &files {
+                let text = fs::read_to_string(root.join(file))
+                    .with_context(|| format!("failed to read `{file}`"))?;
+                if engine::defines_main(&text) {
+                    mains.push(file.clone());
+                }
+            }
+            engine::check_one_main(&describe(target), mains)?;
         }
-        let target = Prepared {
-            target,
-            files,
-            plan,
-        };
-        if target.target.kind == TargetKind::Lib {
-            lib_modules = target.modules();
-        }
-        prepared.push(target);
+        selected.push(Selected { target, files });
     }
-    Ok(prepared)
+    Ok(selected)
 }
 
-/// The target's files to compile, read and scanned, sorted by path.
-fn source_files(root: &Path, target: &Target, tree: &SourceTree) -> Result<Vec<SourceFile>> {
+/// The target's files to compile, sorted by path.
+fn source_files(target: &Target, tree: &SourceTree) -> Result<Vec<String>> {
     let selected = tree.select(
         &GlobList::new(&target.sources)?,
         &GlobList::new(&target.exclude)?,
@@ -267,21 +252,14 @@ fn source_files(root: &Path, target: &Target, tree: &SourceTree) -> Result<Vec<S
             .extension()
             .and_then(|ext| ext.to_str())
             .unwrap_or_default();
-        if !SOURCE_EXTENSIONS.contains(&extension) {
-            if !HEADER_EXTENSIONS.contains(&extension) {
-                style::warning(format!(
-                    "skipping `{path}` in {}: not a C++ source file",
-                    describe(target)
-                ));
-            }
-            continue;
+        if SOURCE_EXTENSIONS.contains(&extension) {
+            files.push(path.to_string());
+        } else if !HEADER_EXTENSIONS.contains(&extension) {
+            style::warning(format!(
+                "skipping `{path}` in {}: not a C++ source file",
+                describe(target)
+            ));
         }
-        let text = fs::read_to_string(root.join(path))
-            .with_context(|| format!("failed to read `{path}`"))?;
-        files.push(SourceFile {
-            path: path.to_string(),
-            scan: Scan::of(&text),
-        });
     }
     if files.is_empty() {
         bail!("{} has no source files", describe(target));
@@ -394,6 +372,96 @@ impl Builder<'_> {
         fs::write(&stamp_path, stamp)
             .with_context(|| format!("failed to write `{}`", stamp_path.display()))?;
         Ok(module)
+    }
+
+    /// Scan every selected file in one `clang-scan-deps` call, then order each
+    /// target's files. A bin that links the library may import its modules.
+    fn prepare<'t>(&self, selected: Vec<Selected<'t>>) -> Result<Vec<Prepared<'t>>> {
+        let lib_target = selected
+            .iter()
+            .map(|s| s.target)
+            .find(|t| t.kind == TargetKind::Lib);
+        let mut jobs = Vec::new();
+        for Selected { target, files } in &selected {
+            let (obj_dir, _) = self.target_dirs(target);
+            let include_dirs = self.include_dirs(target, lib_target);
+            for file in files {
+                let source = self.root.join(file);
+                let output = object_path(&obj_dir, file)?;
+                let mut command = self.compile_command();
+                for dir in &include_dirs {
+                    command.arg(format!("-I{}", dir.display()));
+                }
+                command.arg("-c").arg(&source).arg("-o").arg(&output);
+                let arguments = std::iter::once(command.get_program())
+                    .chain(command.get_args())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                jobs.push(ScanJob {
+                    source,
+                    output,
+                    arguments,
+                });
+            }
+        }
+        let database = self.out.join("scan").join("compile_commands.json");
+        let mut deps = engine::scan(
+            &self.toolchain.scan_deps.path,
+            &database,
+            &jobs,
+            self.verbose,
+        )?
+        .into_iter();
+
+        let mut prepared: Vec<Prepared<'t>> = Vec::with_capacity(selected.len());
+        let mut lib_modules = HashSet::new();
+        let none = HashSet::new();
+        for Selected { target, files } in selected {
+            let files: Vec<SourceFile> = files
+                .into_iter()
+                .zip(deps.by_ref())
+                .map(|(path, deps)| SourceFile { path, deps })
+                .collect();
+            let available = if target.kind == TargetKind::Bin && target.links_lib {
+                &lib_modules
+            } else {
+                &none
+            };
+            let plan = engine::plan(&describe(target), &files, available)?;
+            if plan.imports_std && !self.std.supports_import_std() {
+                let file = files
+                    .iter()
+                    .find(|f| f.deps.requires.iter().any(|m| m == STD_MODULE))
+                    .map_or("", |f| f.path.as_str());
+                bail!(
+                    "`{file}` imports `std`, which needs c++23 or later, but the project's \
+                     std is {}\n\nhelp: set `std = \"c++23\"` or later in [project]",
+                    self.std.as_str()
+                );
+            }
+            let target = Prepared {
+                target,
+                files,
+                plan,
+            };
+            if target.target.kind == TargetKind::Lib {
+                lib_modules = target.modules();
+            }
+            prepared.push(target);
+        }
+        Ok(prepared)
+    }
+
+    /// A target's header search directories, absolute: its own, then the library's
+    /// for a bin that links it.
+    fn include_dirs(&self, target: &Target, lib: Option<&Target>) -> Vec<PathBuf> {
+        let lib = lib.filter(|_| target.kind == TargetKind::Bin && target.links_lib);
+        target
+            .include_dirs
+            .iter()
+            .chain(lib.into_iter().flat_map(|lib| &lib.include_dirs))
+            .map(|dir| self.root.join(dir))
+            .collect()
     }
 
     /// Where a target's objects and compiled interfaces go: `obj/<project>/lib/` and
@@ -942,7 +1010,7 @@ mod tests {
         assert_eq!(err, "could not compile `broken` (bin)");
     }
 
-    /// Mistakes found before any compiler runs, so these need no toolchain.
+    /// A build that fails before anything is compiled.
     fn build_error(manifest: &str, files: &[(&str, &str)]) -> String {
         let temp = tempdir().unwrap();
         write(&temp.path().join("Yam.toml"), manifest);
@@ -971,6 +1039,9 @@ mod tests {
 
     #[test]
     fn import_std_needs_cxx23() {
+        if !have_toolchain() {
+            return;
+        }
         let err = build_error(
             "[project]\nname = \"app\"\nstd = \"c++20\"\n",
             &[("src/main.cpp", "import std;\nint main() {}\n")],
@@ -985,6 +1056,9 @@ mod tests {
 
     #[test]
     fn bins_can_only_import_the_library_they_link() {
+        if !have_toolchain() {
+            return;
+        }
         let err = build_error(
             "[project]\nname = \"app\"\n",
             &[("src/main.cpp", "import nowhere;\nint main() {}\n")],
@@ -993,6 +1067,21 @@ mod tests {
             err.starts_with(
                 "`src/main.cpp` imports module `nowhere`, but no source file of bin target `app` declares it"
             ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn failed_scans_are_reported() {
+        if !have_toolchain() {
+            return;
+        }
+        let err = build_error(
+            "[project]\nname = \"app\"\n",
+            &[("src/main.cpp", "import <vector>;\nint main() {}\n")],
+        );
+        assert!(
+            err.starts_with("could not scan the project's module dependencies"),
             "{err}"
         );
     }
