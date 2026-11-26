@@ -54,8 +54,8 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
    [One standard per project](#one-standard-per-project--decided)).
 5. **Ensure a `std.pcm`** for each distinct standard in use (see [std.pcm](#stdpcm--decided)).
 6. **Scan** new and changed files for module provides/requires (#21, #22). One
-   `clang-scan-deps -format=p1689` call covers every file (`src/engine/scan.rs`);
-   until #22 every file is scanned on every build.
+   `clang-scan-deps -format=p1689` call covers every file whose scan isn't cached
+   (`src/engine/scan.rs`, `src/engine/scan_cache.rs`).
 7. **Build the graph** of module interfaces, objects, `std.pcm` and link steps (#24).
 8. **Decide staleness** for each node (#24).
 9. **Schedule** stale nodes in parallel, in dependency order (#25).
@@ -89,8 +89,12 @@ process.
 - **The scan cache persists between builds** (#22).
   - Each file's P1689 result is keyed on `blake3(file contents)` plus a hash of the
     flags that affect scanning (the project's standard, defines, include dirs, triplet).
+  - The flags hash also covers the scanner's and compiler's path and version. It
+    doesn't cover the file's path, so identical files share a result.
   - Only new or changed files are rescanned.
-  - **A no-op build performs zero scans.**
+  - **A no-op build performs zero scans** and starts no `clang-scan-deps` process.
+  - Headers aren't part of the key, so a header change that adds or removes an
+    `import` isn't seen until header dependencies are tracked (#23).
 - **Header dependencies come from depfiles.** Each compile runs with `-MD -MF`, and
   yam reads the depfile into the state file afterwards, the way ninja maintains
   `.ninja_deps` (#23). Headers never need scanning before a compile, because a
@@ -225,6 +229,7 @@ single read at startup and written at the end of the build.
 target/
 └── <Profile>/                # Debug | Release
     ├── .yam/
+    │   ├── scan-cache.json   # scan results (#22), until the state file takes them over
     │   └── state             # build state file (#26)
     ├── std/<std>/            # std.pcm + std.o per standard in use, e.g. std/c++26/
     ├── modules/<project>/    # the library's compiled module interfaces (.pcm)

@@ -1,11 +1,12 @@
 //! `yam build`: compile every file of the project's lib and bins, archive the lib and
 //! link the bins.
 //!
-//! One batched `clang-scan-deps` call finds every file's module dependencies
-//! ([`engine::scan`]), and each target's files are compiled in the order
-//! [`engine::plan`] gives. Every file is scanned and compiled on every build, one
-//! compile at a time; only `std.pcm` is reused between builds so far. The scan cache
-//! (#22), staleness (#24) and the parallel scheduler (#25) replace most of this.
+//! One batched `clang-scan-deps` call finds the module dependencies of every new or
+//! changed file ([`engine::scan`], cached by [`engine::ScanCache`]), and each
+//! target's files are compiled in the order [`engine::plan`] gives. Every file is
+//! compiled on every build, one at a time; only `std.pcm` and scan results are reused
+//! between builds so far. Staleness (#24) and the parallel scheduler (#25) replace
+//! most of this.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -17,7 +18,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 
 use crate::cli::BuildArgs;
-use crate::engine::{self, Plan, STD_MODULE, ScanJob, SourceFile};
+use crate::engine::{self, Deps, FlagsHash, Key, Plan, STD_MODULE, ScanCache, ScanJob, SourceFile};
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
     report, resolve_targets, validate_tree,
@@ -381,37 +382,8 @@ impl Builder<'_> {
             .iter()
             .map(|s| s.target)
             .find(|t| t.kind == TargetKind::Lib);
-        let mut jobs = Vec::new();
-        for Selected { target, files } in &selected {
-            let (obj_dir, _) = self.target_dirs(target);
-            let include_dirs = self.include_dirs(target, lib_target);
-            for file in files {
-                let source = self.root.join(file);
-                let output = object_path(&obj_dir, file)?;
-                let mut command = self.compile_command();
-                for dir in &include_dirs {
-                    command.arg(format!("-I{}", dir.display()));
-                }
-                command.arg("-c").arg(&source).arg("-o").arg(&output);
-                let arguments = std::iter::once(command.get_program())
-                    .chain(command.get_args())
-                    .map(ToOwned::to_owned)
-                    .collect();
-                jobs.push(ScanJob {
-                    source,
-                    output,
-                    arguments,
-                });
-            }
-        }
-        let database = self.out.join("scan").join("compile_commands.json");
-        let mut deps = engine::scan(
-            &self.toolchain.scan_deps.path,
-            &database,
-            &jobs,
-            self.verbose,
-        )?
-        .into_iter();
+        let deps = self.scan(&selected, lib_target)?;
+        let mut deps = deps.into_iter();
 
         let mut prepared: Vec<Prepared<'t>> = Vec::with_capacity(selected.len());
         let mut lib_modules = HashSet::new();
@@ -450,6 +422,93 @@ impl Builder<'_> {
             prepared.push(target);
         }
         Ok(prepared)
+    }
+
+    /// Every selected file's module dependencies, in order: from the scan cache when
+    /// its contents and flags are unchanged, otherwise from one `clang-scan-deps`
+    /// run over the rest. A build where nothing changed starts no scanner at all.
+    fn scan(&self, selected: &[Selected<'_>], lib_target: Option<&Target>) -> Result<Vec<Deps>> {
+        let toolchain = self.toolchain;
+        let tools = format!(
+            "{} {} {} {}",
+            toolchain.scan_deps.path.display(),
+            toolchain.scan_deps.version,
+            toolchain.cxx.path.display(),
+            toolchain.cxx.version
+        );
+        let (mut cache, discarded) =
+            ScanCache::load(&self.out.join(".yam").join("scan-cache.json"));
+        if let Some(reason) = discarded {
+            style::note(format!("{reason}; scanning every file again"));
+        }
+
+        let mut results: Vec<Option<Deps>> = Vec::new();
+        let mut misses = Vec::new();
+        let mut jobs = Vec::new();
+        for Selected { target, files } in selected {
+            let (obj_dir, _) = self.target_dirs(target);
+            let include_dirs = self.include_dirs(target, lib_target);
+            let mut command = self.compile_command();
+            for dir in &include_dirs {
+                command.arg(format!("-I{}", dir.display()));
+            }
+            let flags = FlagsHash::new(
+                &tools,
+                std::iter::once(command.get_program()).chain(command.get_args()),
+            );
+            for file in files {
+                let source = self.root.join(file);
+                let contents =
+                    fs::read(&source).with_context(|| format!("failed to read `{file}`"))?;
+                let key = Key::new(&flags, &contents);
+                if let Some(deps) = cache.get(key) {
+                    results.push(Some(deps));
+                    continue;
+                }
+                let output = object_path(&obj_dir, file)?;
+                let arguments = std::iter::once(command.get_program())
+                    .chain(command.get_args())
+                    .map(ToOwned::to_owned)
+                    .chain([
+                        "-c".into(),
+                        source.clone().into_os_string(),
+                        "-o".into(),
+                        output.clone().into_os_string(),
+                    ])
+                    .collect();
+                misses.push((results.len(), key));
+                results.push(None);
+                jobs.push(ScanJob {
+                    source,
+                    output,
+                    arguments,
+                });
+            }
+        }
+
+        if self.verbose {
+            style::status(
+                "Scanning",
+                format!(
+                    "{} of {} files ({} cached)",
+                    jobs.len(),
+                    results.len(),
+                    results.len() - jobs.len()
+                ),
+            );
+        }
+        if !jobs.is_empty() {
+            let database = self.out.join("scan").join("compile_commands.json");
+            let fresh = engine::scan(&toolchain.scan_deps.path, &database, &jobs, self.verbose)?;
+            for ((index, key), deps) in misses.into_iter().zip(fresh) {
+                cache.insert(key, deps.clone());
+                results[index] = Some(deps);
+            }
+        }
+        if let Err(err) = cache.save_if_changed() {
+            style::warning(format!("couldn't save the scan cache: {err}"));
+        }
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// A target's header search directories, absolute: its own, then the library's
@@ -801,6 +860,63 @@ mod tests {
         let built = fs::metadata(&pcm).unwrap().modified().unwrap();
         run(&build_args(&dir)).unwrap();
         assert_eq!(fs::metadata(&pcm).unwrap().modified().unwrap(), built);
+    }
+
+    /// How many files the last scan covered: the entries in its compilation database,
+    /// which is written only when something needs scanning.
+    fn scanned(dir: &Path) -> Option<usize> {
+        let path = dir.join("target/Debug/scan/compile_commands.json");
+        let text = fs::read_to_string(&path).ok()?;
+        fs::remove_file(&path).unwrap();
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        Some(entries.len())
+    }
+
+    #[test]
+    fn unchanged_files_are_never_rescanned() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("cached");
+        new_project(&dir, true, false);
+        write(
+            &dir.join("src/main.cpp"),
+            "import std;\nimport cached;\n\nint main() {\n    std::println(\"{}\", cached::add(1, 2));\n}\n",
+        );
+        let cache = dir.join("target/Debug/.yam/scan-cache.json");
+
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), Some(2));
+        let saved = fs::metadata(&cache).unwrap().modified().unwrap();
+
+        // A no-op build scans nothing and leaves the cache file alone.
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), None);
+        assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), saved);
+
+        // Rewriting a file with the same contents is still a hit.
+        let main = fs::read_to_string(dir.join("src/main.cpp")).unwrap();
+        write(&dir.join("src/main.cpp"), &main);
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), None);
+
+        // Only the edited file is scanned again.
+        write(&dir.join("src/main.cpp"), &main.replace("(1, 2)", "(2, 2)"));
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), Some(1));
+        assert_eq!(run_binary(&exe(&dir, "Debug", "cached")), "4\n");
+
+        // A release build has its own cache.
+        let mut release = build_args(&dir);
+        release.release = true;
+        run(&release).unwrap();
+        assert!(dir.join("target/Release/.yam/scan-cache.json").is_file());
+
+        // A corrupt cache is discarded, and everything is scanned again.
+        fs::write(&cache, "not json").unwrap();
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(scanned(&dir), Some(2));
     }
 
     #[test]
