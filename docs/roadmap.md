@@ -358,7 +358,8 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       Cargo. `yam build --keep-going` continues every independent job and reports
       all errors at the end.
     - Output is grouped per job.
-    - Optional make jobserver client (`jobserver` crate).
+    - Optional make jobserver client (`jobserver` crate). Deferred: its client
+      constructor is `unsafe`, and yam denies `unsafe_code`.
 26. **Binary build state file** (engine, perf)
     - One compact file, loaded with a single read at startup.
     - Versioned header; a corrupt file triggers a rebuild, not a crash.

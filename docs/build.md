@@ -236,9 +236,19 @@ single read at startup and written at the end of the build.
   loading. The exact crate (hand-rolled, `rkyv`, `bincode`, …) is chosen in #26 based
   on startup measurements.
 
-## Scheduler — Proposed (#25)
+## Scheduler — Decided (#25)
 
-- Jobs run in dependency order, with `-j` defaulting to the number of available CPUs.
+- **Parallel:** up to `-j` nodes of the build graph run at once, each as soon as
+  everything it needs is done. `-j` defaults to the number of available CPUs. Among
+  ready nodes the earliest in graph order goes first, which puts module interfaces,
+  which unblock the most, ahead of everything else.
+- **One thread decides, workers run:** the main thread checks staleness, starts jobs
+  and updates every record. Each job's commands run on a worker thread, spawned
+  directly with `std::process`, never through a shell.
+- **Grouped output:** each job's output is captured and printed as one block when it
+  finishes, so compiler diagnostics aren't interleaved. Compiles ask Clang for color
+  (`-fdiagnostics-color=always`), and printing strips it again when the output isn't
+  a terminal or `--color never` is set.
 - **Failure handling, like Cargo:**
   - **By default**, after the first failure yam starts no new jobs. Jobs already
     running finish, with their output and errors printed, while yam says
@@ -247,13 +257,14 @@ single read at startup and written at the end of the build.
   - **`yam build --keep-going`** keeps starting every job that doesn't depend on a
     failed one, skips the jobs downstream of a failure, and fails at the end with
     every error reported. This matches `cargo build --keep-going`.
+  - Each distinct failure is reported once, with a count when several files of one
+    target failed: ``could not compile `app` (bin): 2 files failed``.
   - Either way, outputs finished before the failure are recorded (#24), so the next
     build doesn't redo them.
-- Each job's output is captured and printed as one block, so compiler diagnostics
-  aren't interleaved.
-- Compiler processes are spawned directly with `std::process`, never through a shell.
-- Optional make jobserver client (`jobserver` crate), so yam shares CPU slots when
-  it's run from inside another build.
+- **No make jobserver client yet.** The `jobserver` crate's client constructor is
+  `unsafe` (it takes ownership of inherited file descriptors), and yam denies
+  `unsafe_code`. Until there's a safe way, run yam inside another build with an
+  explicit `-j`.
 
 ## Build directory layout — Proposed
 
