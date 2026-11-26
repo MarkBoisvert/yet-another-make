@@ -25,13 +25,17 @@ const IMPORT_STD_GATES: [(&str, &str); 3] = [
 /// The oldest CMake that can build the modules style (see [`IMPORT_STD_GATES`]).
 const MIN_MODULES_CMAKE: (u32, u32) = (4, 2);
 
+/// The first CMake whose `import std` support needs no experimental gate. It ignores
+/// `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`, warning that the variable is unused.
+const IMPORT_STD_STABLE_CMAKE: (u32, u32) = (4, 5);
+
 /// Configure `dir/build-cmake` with ninja.
 ///
 /// # Errors
 ///
-/// Fails if the project, toolchain or CMake can't be found, the CMake version has no
-/// known `import std` gate (for module projects, unless `gate` is given), or
-/// configuring fails.
+/// Fails if the project, toolchain or CMake can't be found, the CMake version needs
+/// an `import std` gate that isn't known (for module projects, unless `gate` is
+/// given), or configuring fails.
 pub fn configure(dir: &Path, release: bool, gate: Option<&str>) -> Result<PathBuf> {
     let meta = project::load(dir)?;
     let toolchain = Toolchain::discover()?;
@@ -78,8 +82,8 @@ pub fn configure(dir: &Path, release: bool, gate: Option<&str>) -> Result<PathBu
             );
         }
         let gate = match gate {
-            Some(gate) => gate.to_string(),
-            None => import_std_gate(&version)?.to_string(),
+            Some(gate) => Some(gate),
+            None => import_std_gate(&version)?,
         };
         // CMake resolves the manifest's relative paths against the file it's given,
         // which breaks on Debian's layout, so hand it one with absolute paths.
@@ -87,12 +91,13 @@ pub fn configure(dir: &Path, release: bool, gate: Option<&str>) -> Result<PathBu
         fs::create_dir_all(json.parent().unwrap_or(dir))?;
         fs::write(&json, modules_json(&toolchain))
             .with_context(|| format!("failed to write `{}`", json.display()))?;
-        command
-            .arg(format!("-DCMAKE_EXPERIMENTAL_CXX_IMPORT_STD={gate}"))
-            .arg(format!(
-                "-DCMAKE_CXX_STDLIB_MODULES_JSON={}",
-                json.display()
-            ));
+        if let Some(gate) = gate {
+            command.arg(format!("-DCMAKE_EXPERIMENTAL_CXX_IMPORT_STD={gate}"));
+        }
+        command.arg(format!(
+            "-DCMAKE_CXX_STDLIB_MODULES_JSON={}",
+            json.display()
+        ));
     }
 
     let status = command
@@ -123,18 +128,25 @@ fn parse_cmake_version(text: &str) -> Option<String> {
 
 /// Whether CMake `version` (`major.minor`) can build the modules style.
 fn supports_modules(version: &str) -> bool {
-    let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
-    match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(major), Some(minor)) => (major, minor) >= MIN_MODULES_CMAKE,
-        _ => false,
-    }
+    major_minor(version).is_some_and(|version| version >= MIN_MODULES_CMAKE)
 }
 
-fn import_std_gate(version: &str) -> Result<&'static str> {
+/// `(major, minor)` from `major.minor`.
+fn major_minor(version: &str) -> Option<(u32, u32)> {
+    let (major, minor) = version.split_once('.')?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` value CMake `version` needs, or `None`
+/// from the version where `import std` is no longer experimental.
+fn import_std_gate(version: &str) -> Result<Option<&'static str>> {
+    if major_minor(version).is_some_and(|version| version >= IMPORT_STD_STABLE_CMAKE) {
+        return Ok(None);
+    }
     IMPORT_STD_GATES
         .iter()
         .find(|(v, _)| *v == version)
-        .map(|(_, gate)| *gate)
+        .map(|(_, gate)| Some(*gate))
         .with_context(|| {
             format!(
                 "no known `import std` gate for CMake {version}\n\nhelp: find \
@@ -189,9 +201,11 @@ mod tests {
     fn knows_the_gate_per_version() {
         assert_eq!(
             import_std_gate("4.4").unwrap(),
-            "f35a9ac6-8463-4d38-8eec-5d6008153e7d"
+            Some("f35a9ac6-8463-4d38-8eec-5d6008153e7d")
         );
-        let err = import_std_gate("4.9").unwrap_err().to_string();
+        assert_eq!(import_std_gate("4.5").unwrap(), None);
+        assert_eq!(import_std_gate("5.0").unwrap(), None);
+        let err = import_std_gate("4.1").unwrap_err().to_string();
         assert!(err.contains("--import-std-gate"), "{err}");
         assert!(supports_modules("4.2") && supports_modules("5.0"));
         assert!(!supports_modules("3.31") && !supports_modules("4.1"));
@@ -210,11 +224,10 @@ mod tests {
             return;
         }
         // Ubuntu's runner ships CMake 3.31, too old for the modules style.
-        let modules = cmake_version().is_ok_and(|v| {
-            supports_modules(&v) && IMPORT_STD_GATES.iter().any(|(known, _)| *known == v)
-        });
+        let modules =
+            cmake_version().is_ok_and(|v| supports_modules(&v) && import_std_gate(&v).is_ok());
         if !modules {
-            eprintln!("skipping the modules style: needs CMake 4.2 to 4.4");
+            eprintln!("skipping the modules style: needs CMake 4.2 or newer");
         }
         let styles = if modules {
             vec![Style::Modules, Style::Legacy]
