@@ -1,10 +1,10 @@
-//! Benchmark harness for `yam`: generates equivalent `yam` and CMake + ninja projects
-//! and applies the edits each benchmark scenario needs. The `hyperfine` runner lands
-//! in #19.
+//! Benchmark harness for `yam`: generates equivalent `yam` and CMake + ninja projects,
+//! applies the edits each benchmark scenario needs, and times them with `hyperfine`.
 
 mod cmake;
 mod graph;
 mod project;
+mod run;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,7 +17,7 @@ use project::{Meta, Scenario, Style};
 #[derive(Parser)]
 #[command(
     name = "bench",
-    about = "Generate and edit yam vs CMake + ninja benchmark projects"
+    about = "Generate, edit and time yam vs CMake + ninja benchmark projects"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -62,6 +62,33 @@ enum Command {
         /// doesn't know
         #[arg(long, value_name = "UUID")]
         import_std_gate: Option<String>,
+    },
+    /// Time every scenario × style × size with hyperfine, saving results as it goes
+    Run {
+        /// Where generated projects live (reused between runs)
+        #[arg(long, default_value = "target/bench")]
+        work: PathBuf,
+        /// Results file; cells already in it are skipped
+        #[arg(long, default_value = "target/bench/results.json")]
+        results: PathBuf,
+        #[arg(long, value_enum, value_delimiter = ',', default_values = ["modules", "legacy"])]
+        styles: Vec<Style>,
+        #[arg(long, value_delimiter = ',', default_values = ["100", "1000", "10000"])]
+        sizes: Vec<usize>,
+        /// Scenarios to run (default: all)
+        #[arg(long, value_delimiter = ',')]
+        scenarios: Vec<String>,
+        /// Parallel jobs for every tool (default: available cores)
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Also time this `yam` binary (needs multi-file builds, #20)
+        #[arg(long, value_name = "PATH")]
+        yam: Option<PathBuf>,
+    },
+    /// Print a results file as the Markdown tables in docs/bench.md
+    Report {
+        #[arg(default_value = "target/bench/results.json")]
+        results: PathBuf,
     },
 }
 
@@ -108,6 +135,38 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let build = cmake::configure(&dir, release, import_std_gate.as_deref())?;
             println!("configured `{}`", build.display());
+        }
+        Command::Run {
+            work,
+            results,
+            styles,
+            sizes,
+            scenarios,
+            jobs,
+            yam,
+        } => {
+            let scenarios = if scenarios.is_empty() {
+                run::SCENARIOS.iter().map(ToString::to_string).collect()
+            } else {
+                scenarios
+            };
+            let jobs = jobs.unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+            });
+            let yam = yam.map(|path| std::path::absolute(&path).unwrap_or(path));
+            run::run(&run::Plan {
+                work: std::path::absolute(&work)?,
+                results,
+                styles,
+                sizes,
+                scenarios,
+                jobs,
+                yam,
+            })?;
+        }
+        Command::Report { results } => {
+            let text = std::fs::read_to_string(&results)?;
+            print!("{}", run::report(&serde_json::from_str(&text)?));
         }
     }
     Ok(())
