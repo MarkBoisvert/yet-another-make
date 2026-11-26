@@ -354,7 +354,10 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Cycles are reported with the module chain, e.g. `a` → `b` → `a`.
 25. **Parallel scheduler** (engine, perf)
     - Topological execution, `-j` defaulting to the number of CPUs.
-    - Keep going on failure; output is grouped per job.
+    - After the first failure, start no new jobs and let running ones finish, like
+      Cargo. `yam build --keep-going` continues every independent job and reports
+      all errors at the end.
+    - Output is grouped per job.
     - Optional make jobserver client (`jobserver` crate).
 26. **Binary build state file** (engine, perf)
     - One compact file, loaded with a single read at startup.

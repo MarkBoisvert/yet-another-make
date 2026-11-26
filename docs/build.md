@@ -239,8 +239,16 @@ single read at startup and written at the end of the build.
 ## Scheduler — Proposed (#25)
 
 - Jobs run in dependency order, with `-j` defaulting to the number of available CPUs.
-- **Keep going on failure:** independent jobs continue after a failure, and the build
-  fails at the end with every error reported.
+- **Failure handling, like Cargo:**
+  - **By default**, after the first failure yam starts no new jobs. Jobs already
+    running finish, with their output and errors printed, while yam says
+    `warning: build failed, waiting for other jobs to finish...`. Then the build
+    fails. This matches `cargo build`.
+  - **`yam build --keep-going`** keeps starting every job that doesn't depend on a
+    failed one, skips the jobs downstream of a failure, and fails at the end with
+    every error reported. This matches `cargo build --keep-going`.
+  - Either way, outputs finished before the failure are recorded (#24), so the next
+    build doesn't redo them.
 - Each job's output is captured and printed as one block, so compiler diagnostics
   aren't interleaved.
 - Compiler processes are spawned directly with `std::process`, never through a shell.
