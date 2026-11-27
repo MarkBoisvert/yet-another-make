@@ -57,7 +57,8 @@ those pass.
 * **Performance is a requirement, not an afterthought.** The no-op and incremental
   paths must not spawn processes or allocate per file without reason. Follow the
   engine design in `docs/build.md`, and update that doc in the same PR when a
-  Proposed section changes.
+  Proposed section changes. Every performance change follows **Performance
+  Discipline** below.
 * **Never link LLVM into `yam`.** Module dependencies come from batched
   `clang-scan-deps -format=p1689`, plus the persistent scan cache. `yam-iface` is a
   separate tool built by `yam-toolchain`.
@@ -70,6 +71,78 @@ those pass.
   compiles all of its own files at `max(own std, declared std of each direct
   dependency)`; there's no whole-graph or per-file standard. `[dependencies]` is
   parsed but reserved until M4. See roadmap #10 and `docs/build.md`.
+
+### Performance Discipline (strict)
+
+**Targets.** The Linux release build is **static musl + mimalloc** (x86_64 and aarch64,
+#8), so every performance change is measured on it first. Dynamic glibc, macOS and
+Windows are first-class too: a change must not regress them. When a platform can't
+be measured here (macOS and Windows, today), say so in the PR, and keep the change
+platform-neutral (`std` or a crate, never `cfg`-gated tricks) so CI covers it.
+
+**Measure, don't assume.**
+* Every performance claim in a PR, doc or reply comes from a measurement made for it,
+  with the command that made it. Anything not measured is written as "not measured".
+* Compare binaries side by side: keep the old binary, and time old and new for
+  **both C libraries** (glibc and musl) in the **same** `hyperfine -N` invocation
+  (`-w 10`, at least 40–50 runs), never across sessions. Wait until the machine is
+  idle (1-minute load below 2) and nothing else is building.
+* Report the **median of at least three rounds**, with user and system time as well
+  as wall time. Differences within about 0.5 ms or one σ are noise; don't report a
+  single round as a result, and don't call two builds equal or one faster from one
+  run.
+* Cover **both styles** (modules and legacy) at 1k units at least, and say which
+  scenarios and sizes were measured. Compare against the `ninja` baseline in
+  `docs/bench.md`.
+* **Isolate each change.** When two changes land together, measure each alone and
+  together before crediting either. An interaction can hide a gain or invent one
+  (the shared buffers only paid off with huge pages off).
+* A state-format change invalidates old state: benchmark the new binary on its own
+  copy of each project, at a path of the same length, built once before timing.
+
+**Profile before optimizing.**
+* Profile the static musl binary with `samply record --save-only
+  --unstable-presymbolicate -r 4000 --iteration-count 100`, built with
+  `CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`.
+  Look at the main thread separately from worker threads: the main thread is the
+  wall-clock path.
+* Count instead of guessing: `strace -c -f` for system calls, `/usr/bin/time -f %M`
+  for peak memory, and mimalloc's `MIMALLOC_SHOW_STATS=1`. Check memory when system
+  time moves without a code reason.
+
+**Prove a performance change is still correct.**
+* Anything touching staleness, hashing, scanning or the state file runs the edit
+  scenarios (`touch`, `leaf-impl`, `leaf-iface`, `impl-1pct`, `mid-iface`,
+  `add-unit`) with the old and new binaries on fresh copies, in both styles. The
+  compile counts must match, and the build after each must compile nothing.
+* A command hash keeps the rule "a different command is a different hash". Say in
+  the PR when a change forces one full rebuild (a state-format version bump or new
+  hash inputs).
+
+**Code patterns for the hot path.** musl's `memcpy` and `memcmp` are slow for small
+sizes, so per-file small work costs far more there than on glibc. These patterns help
+every platform:
+* No per-file or per-input path joins, `format!`, `String` keys or small copies on
+  the no-op path. Intern paths and names once (`StrTable`, path ids, shared
+  `Arc<str>`), key records by id, and build a `Command` only for a step that runs.
+* Hash what many commands share once (a cloned `CommandHasher`) and add only the
+  per-file part; don't hash what's already compared as inputs.
+* Few large allocations, not many small ones: one buffer, sized once up front (a
+  growing `Vec` moves into fresh memory each time it grows).
+* Worker threads on the no-op path don't allocate, so the allocator never sets up a
+  heap for them. They write into memory allocated before they start.
+* Keep mimalloc's `no_thp` feature. Never change a process-wide setting that child
+  processes inherit (such as `prctl(PR_SET_THP_DISABLE)`): it would reach the
+  compilers yam runs.
+* Overlap independent work (`stat` prefetch during the manifest read and source walk)
+  rather than adding threads to the critical path.
+* Replacing libc functions (musl's `memcpy` and friends) is out: it needs `unsafe`
+  or C. Revisit only if #28 shows the musl gap growing with project size.
+
+**Write it down.** Record each result in `docs/bench.md` as a before/after table
+(glibc and musl, with the `ninja` column) plus what was tried and dropped, and update
+the design in `docs/build.md`. When a new measurement contradicts an earlier claim,
+correct the claim in the same change.
 
 ### Terminology (strict)
 

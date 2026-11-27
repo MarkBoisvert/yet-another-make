@@ -11,6 +11,7 @@ pub mod plan;
 pub mod scan;
 pub mod scan_cache;
 pub mod state;
+pub mod strings;
 
 pub use entry::defines_main;
 pub use graph::{Action, GraphTarget, Node, graph};
@@ -20,6 +21,6 @@ pub use plan::{
     Plan, PlanError, STD_MODULE, SourceFile, Step, check_one_main, has_extension,
     is_interface_file, plan,
 };
-pub use scan::{Deps, Provided, ScanError, ScanJob, scan};
+pub use scan::{Deps, ModuleName, Provided, ScanError, ScanJob, scan};
 pub use scan_cache::{FlagsHash, HeaderDigest, Key, ScanCache};
 pub use state::{State, StoreError};

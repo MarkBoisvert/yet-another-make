@@ -7,7 +7,10 @@
 //! - **Layout:** fixed-width little-endian fields. A header (magic, format version,
 //!   yam version), then one table of every string, then one section per record, then
 //!   a blake3 checksum of everything before it. Strings are referred to by index, so
-//!   each path is stored once. The whole file is read with one `fs::read`.
+//!   each path is stored once. The output record's paths and the header names are
+//!   stored as [`StrTable`]s instead: every string's bytes back to back, then where
+//!   each ends, so loading one is a single copy. Other records refer to files by
+//!   their output record path id. The whole file is read with one `fs::read`.
 //! - **Snapshot and journal, like ninja's logs:** the snapshot is rewritten (to a
 //!   temporary file, then renamed into place) at the end of a build that changed
 //!   anything. While a build runs, each finished job's results are appended to
@@ -25,16 +28,17 @@ use std::path::{Path, PathBuf};
 use rustc_hash::FxHashMap;
 
 use super::headers::HeaderRecord;
-use super::outputs::{Outputs, Stat};
-use super::scan::{Deps, Provided};
+use super::outputs::{Entry, Outputs, Stat};
+use super::scan::{Deps, ModuleName, Provided};
 use super::scan_cache::{Key, ScanCache};
+use super::strings::StrTable;
 use crate::manifest::{DirCache, Listing};
 use crate::toolchain::{self, ModuleSource, StdModules, Tool, Toolchain, Version};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"YAMSTATE";
 const JOURNAL_MAGIC: &[u8; 8] = b"YAMJOURN";
 /// Bumped whenever the layout of either file changes.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const YAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// How many bytes of a record's blake3 hash the journal keeps as its checksum.
 const RECORD_CHECK: usize = 8;
@@ -221,7 +225,9 @@ impl State {
         if !changed {
             return Ok(());
         }
-        self.headers.prune();
+        let outputs = &self.outputs;
+        self.headers
+            .prune(|object| Path::new(outputs.path(object)).exists());
         let bytes = encode_snapshot(self);
         if let Some(dir) = self.snapshot.parent() {
             fs::create_dir_all(dir)?;
@@ -259,7 +265,7 @@ impl State {
     fn apply(&mut self, parts: Parts) {
         self.outputs = parts.outputs;
         self.scan = ScanCache::from_entries(parts.scans);
-        self.headers = HeaderRecord::from_parts(parts.header_names, parts.headers);
+        self.headers = parts.headers;
         self.dirs = DirCache::from_listings(parts.dirs);
         self.toolchain = parts.toolchain;
     }
@@ -272,7 +278,8 @@ impl State {
                 inputs,
             } => self.outputs.replay(&output, command, &inputs),
             Record::Headers { object, headers } => {
-                self.headers.record(Path::new(&object), headers);
+                let id = self.outputs.intern(Path::new(&object));
+                self.headers.record(id, &object, headers);
             }
             Record::Scan { key, deps } => self.scan.insert(key, deps),
         }
@@ -287,8 +294,7 @@ impl State {
 struct Parts {
     outputs: Outputs,
     scans: HashMap<Key, Deps>,
-    header_names: Vec<String>,
-    headers: FxHashMap<String, Vec<u32>>,
+    headers: HeaderRecord,
     dirs: HashMap<String, Listing>,
     toolchain: Option<toolchain::Cached>,
 }
@@ -329,6 +335,17 @@ impl Writer {
         self.body.extend_from_slice(hash);
     }
 
+    /// A table inline: its count, each string's end, then all of its bytes.
+    fn table(&mut self, table: &StrTable) {
+        let (text, ends) = table.parts();
+        self.len(ends.len());
+        for &end in ends {
+            self.u32(end);
+        }
+        self.len(text.len());
+        self.body.extend_from_slice(text.as_bytes());
+    }
+
     fn str(&mut self, value: &str) {
         let id = if let Some(&id) = self.ids.get(value) {
             id
@@ -348,25 +365,27 @@ fn encode_snapshot(state: &State) -> Vec<u8> {
 
     let tables = outputs.parts();
     let (paths, hashes, seen, entries) = (tables.paths, tables.hashes, tables.seen, tables.entries);
-    w.len(paths.len());
-    for path in paths {
-        w.str(path);
-    }
+    let all_inputs = tables.inputs;
+    w.table(paths);
     w.len(hashes.len());
     for hash in hashes {
         w.hash(hash);
     }
-    w.len(seen.len());
-    for (&path, &(stat, hash)) in seen {
+    w.len(seen.iter().flatten().count());
+    for (path, &(stat, hash)) in (0u32..)
+        .zip(seen)
+        .filter_map(|(id, s)| Some((id, s.as_ref()?)))
+    {
         w.u32(path);
         w.u64(stat.mtime);
         w.u64(stat.size);
         w.u32(hash);
     }
     w.len(entries.len());
-    for (output, (command, inputs)) in entries {
-        w.str(output);
-        w.hash(command);
+    for (&output, entry) in entries {
+        let inputs = &all_inputs[entry.range()];
+        w.u32(output);
+        w.hash(&entry.command);
         w.len(inputs.len());
         for &(path, hash) in inputs {
             w.u32(path);
@@ -381,13 +400,14 @@ fn encode_snapshot(state: &State) -> Vec<u8> {
         write_deps(&mut w, deps);
     }
 
-    let records = headers.entries();
-    w.len(records.len());
+    let (names, records) = headers.parts();
+    w.table(names);
+    w.len(headers.len());
     for (object, ids) in records {
-        w.str(object);
+        w.u32(object);
         w.len(ids.len());
         for &id in ids {
-            w.str(headers.name(id));
+            w.u32(id);
         }
     }
 
@@ -564,6 +584,7 @@ fn frame(out: &mut Vec<u8>, record: &Record) {
 
 /// Little-endian input over a byte slice. Every read checks the bounds, so a
 /// truncated or corrupt file fails to decode rather than panicking.
+#[derive(Clone)]
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -610,6 +631,32 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(self.take(len)?).ok()
     }
 
+    /// A table written by `Writer::table`: one copy of its bytes and one UTF-8
+    /// check for the lot.
+    fn table(&mut self) -> Option<StrTable> {
+        let count = self.len()?;
+        let ends = (0..count).map(|_| self.u32()).collect::<Option<Vec<_>>>()?;
+        let len = self.len()?;
+        let text = std::str::from_utf8(self.take(len)?).ok()?.to_string();
+        StrTable::from_parts(text, ends)
+    }
+
+    /// How many items the next `count` records hold in all, where each record is
+    /// `head` bytes, a count, then that many `item`-byte items. Reads ahead on a
+    /// copy, so a buffer for all of them can be allocated once at its final size:
+    /// growing one as it fills would move it, touching fresh memory each time.
+    fn total_items(&self, count: usize, head: usize, item: usize) -> Option<usize> {
+        let mut ahead = self.clone();
+        let mut total = 0usize;
+        for _ in 0..count {
+            ahead.take(head)?;
+            let len = ahead.len()?;
+            ahead.take(len.checked_mul(item)?)?;
+            total = total.checked_add(len)?;
+        }
+        Some(total)
+    }
+
     fn done(&self) -> bool {
         self.at == self.bytes.len()
     }
@@ -619,6 +666,9 @@ impl<'a> Reader<'a> {
 struct Body<'a> {
     reader: Reader<'a>,
     strings: Vec<&'a str>,
+    /// Module names made so far, by string id: each distinct name is allocated
+    /// once, however many scan results name it.
+    names: Vec<Option<ModuleName>>,
 }
 
 impl<'a> Body<'a> {
@@ -627,18 +677,28 @@ impl<'a> Body<'a> {
         self.strings.get(id).copied()
     }
 
+    /// A module name, shared with every other use of the same string.
+    fn name(&mut self) -> Option<ModuleName> {
+        let id = self.reader.u32()? as usize;
+        let slot = self.names.get_mut(id)?;
+        if slot.is_none() {
+            *slot = Some(ModuleName::from(*self.strings.get(id)?));
+        }
+        slot.clone()
+    }
+
     fn deps(&mut self) -> Option<Deps> {
         let provides = match self.reader.u8()? {
             0 => None,
             kind @ (1 | 2) => Some(Provided {
-                name: self.str()?.to_string(),
+                name: self.name()?,
                 is_interface: kind == 2,
             }),
             _ => return None,
         };
         let count = self.reader.len()?;
         let requires = (0..count)
-            .map(|_| self.str().map(str::to_string))
+            .map(|_| self.name())
             .collect::<Option<Vec<_>>>()?;
         Some(Deps { provides, requires })
     }
@@ -717,38 +777,44 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(Parts, [u8; 32])> {
     let strings = (0..count)
         .map(|_| reader.inline_str())
         .collect::<Option<Vec<_>>>()?;
-    let mut b = Body { reader, strings };
+    let names = vec![None; strings.len()];
+    let mut b = Body {
+        reader,
+        strings,
+        names,
+    };
 
-    let count = b.reader.len()?;
-    let paths = (0..count)
-        .map(|_| b.str().map(str::to_string))
-        .collect::<Option<Vec<_>>>()?;
+    let paths = b.reader.table()?;
     let count = b.reader.len()?;
     let hashes = (0..count)
         .map(|_| b.reader.hash())
         .collect::<Option<Vec<_>>>()?;
     let count = b.reader.len()?;
-    let mut seen = HashMap::with_capacity(count);
+    let mut seen = vec![None; paths.len() as usize];
     for _ in 0..count {
-        let path = b.reader.u32()?;
+        let path = b.reader.u32()? as usize;
         let stat = Stat {
             mtime: b.reader.u64()?,
             size: b.reader.u64()?,
         };
-        seen.insert(path, (stat, b.reader.u32()?));
+        *seen.get_mut(path)? = Some((stat, b.reader.u32()?));
     }
     let count = b.reader.len()?;
-    let mut entries = HashMap::with_capacity(count);
+    let mut entries = FxHashMap::with_capacity_and_hasher(count, rustc_hash::FxBuildHasher);
+    // Every output's inputs go in one buffer: an output id and its command hash,
+    // then its inputs as two ids each.
+    let mut inputs = Vec::with_capacity(b.reader.total_items(count, 4 + 32, 8)?);
     for _ in 0..count {
-        let output = b.str()?.to_string();
+        let output = b.reader.u32()?;
         let command = b.reader.hash()?;
-        let inputs = b.reader.len()?;
-        let inputs = (0..inputs)
-            .map(|_| Some((b.reader.u32()?, b.reader.u32()?)))
-            .collect::<Option<Vec<_>>>()?;
-        entries.insert(output, (command, inputs));
+        let len = b.reader.len()?;
+        let start = u32::try_from(inputs.len()).ok()?;
+        for _ in 0..len {
+            inputs.push((b.reader.u32()?, b.reader.u32()?));
+        }
+        entries.insert(output, Entry::new(command, start, u32::try_from(len).ok()?));
     }
-    let outputs = Outputs::from_parts(paths, hashes, seen, entries)?;
+    let outputs = Outputs::from_parts(paths, hashes, seen, entries, inputs)?;
 
     let count = b.reader.len()?;
     let mut scans = HashMap::with_capacity(count);
@@ -757,27 +823,22 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(Parts, [u8; 32])> {
         scans.insert(key, b.deps()?);
     }
 
-    // Header names are interned as they're read: each string-table id becomes a
-    // header id the first time an object lists it, so no header is copied twice.
+    let names = b.reader.table()?;
     let count = b.reader.len()?;
-    let mut headers = FxHashMap::with_capacity_and_hasher(count, rustc_hash::FxBuildHasher);
-    let mut header_names: Vec<String> = Vec::new();
-    let mut header_of = vec![u32::MAX; b.strings.len()];
+    let mut records = FxHashMap::with_capacity_and_hasher(count, rustc_hash::FxBuildHasher);
+    // Every object's header ids go in one buffer: an object id, then its ids.
+    let mut ids = Vec::with_capacity(b.reader.total_items(count, 4, 4)?);
     for _ in 0..count {
-        let object = b.str()?.to_string();
+        let object = b.reader.u32()?;
+        (object < outputs.path_count()).then_some(())?;
         let len = b.reader.len()?;
-        let mut ids = Vec::with_capacity(len);
+        let start = u32::try_from(ids.len()).ok()?;
         for _ in 0..len {
-            let string = b.reader.u32()? as usize;
-            let slot = header_of.get_mut(string)?;
-            if *slot == u32::MAX {
-                *slot = u32::try_from(header_names.len()).ok()?;
-                header_names.push(b.strings[string].to_string());
-            }
-            ids.push(*slot);
+            ids.push(b.reader.u32()?);
         }
-        headers.insert(object, ids);
+        records.insert(object, (start, u32::try_from(len).ok()?));
     }
+    let headers = HeaderRecord::from_parts(names, records, ids)?;
 
     let count = b.reader.len()?;
     let mut dirs = HashMap::with_capacity(count);
@@ -802,7 +863,6 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(Parts, [u8; 32])> {
         Parts {
             outputs,
             scans,
-            header_names,
             headers,
             dirs,
             toolchain,
@@ -870,14 +930,14 @@ fn next_record(reader: &mut Reader<'_>) -> Option<Record> {
             let provides = match r.u8()? {
                 0 => None,
                 kind @ (1 | 2) => Some(Provided {
-                    name: r.inline_str()?.to_string(),
+                    name: r.inline_str()?.into(),
                     is_interface: kind == 2,
                 }),
                 _ => return None,
             };
             let count = r.len()?;
             let requires = (0..count)
-                .map(|_| r.inline_str().map(str::to_string))
+                .map(|_| r.inline_str().map(ModuleName::from))
                 .collect::<Option<Vec<_>>>()?;
             Record::Scan {
                 key,
@@ -976,7 +1036,8 @@ mod tests {
         assert!(!state.outputs.is_fresh(&p.path("a.o"), command(), &inputs));
         state.outputs.record(&p.path("a.o"), command(), &inputs);
         state.scan.insert(key(b"a"), deps());
-        state.headers.record(
+        record_headers(
+            state,
             &p.path("a.o"),
             vec!["src/a.hpp".into(), "include/b.hpp".into()],
         );
@@ -984,6 +1045,21 @@ mod tests {
         let mut tree_cache = std::mem::take(&mut state.dirs);
         crate::manifest::SourceTree::scan_cached(p.dir.path(), &mut tree_cache).unwrap();
         state.dirs = tree_cache;
+    }
+
+    fn record_headers(state: &mut State, object: &Path, headers: Vec<String>) {
+        let id = state.outputs.intern(object);
+        state.headers.record(id, &object.to_string_lossy(), headers);
+    }
+
+    fn headers_of(state: &mut State, object: &Path) -> Vec<String> {
+        let id = state.outputs.intern(object);
+        state
+            .headers
+            .names_of(id)
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 
     fn assert_filled(p: &Project, state: &mut State) {
@@ -994,7 +1070,7 @@ mod tests {
         );
         assert_eq!(state.scan.get(key(b"a")), Some(deps()));
         assert_eq!(
-            state.headers.names_of(&p.path("a.o")),
+            headers_of(state, &p.path("a.o")),
             ["src/a.hpp", "include/b.hpp"]
         );
         assert_eq!(state.toolchain(), Some(&cached_toolchain()));
@@ -1082,9 +1158,7 @@ mod tests {
         // before it saves.
         let (mut state, _) = p.load();
         state.scan.insert(key(b"new"), Deps::default());
-        state
-            .headers
-            .record(&p.path("a.o"), vec!["src/c.hpp".into()]);
+        record_headers(&mut state, &p.path("a.o"), vec!["src/c.hpp".into()]);
         state.flush().unwrap();
         state.scan.insert(key(b"second"), Deps::default());
         state.flush().unwrap();
@@ -1095,7 +1169,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(state.scan.get(key(b"new")), Some(Deps::default()));
         assert_eq!(state.scan.get(key(b"second")), Some(Deps::default()));
-        assert_eq!(state.headers.names_of(&p.path("a.o")), ["src/c.hpp"]);
+        assert_eq!(headers_of(&mut state, &p.path("a.o")), ["src/c.hpp"]);
 
         // Saving folds the journal into the snapshot.
         state.save().unwrap();

@@ -102,10 +102,13 @@ yet-another-make/
    - Record the scanning decisions: no LLVM linking, batched P1689 scans, scan cache,
      `-MD` depfiles, fast-path scanner deferred.
    - Record the build state file format and the perf goals and gates.
-6. **CLAUDE.md for the Rust repo** (docs)
+6. **CLAUDE.md for the Rust repo** (docs), now `AGENTS.md`
    - Commands, the zsh `-ic` shell rule, the portability rule and doc pointers.
    - Rust idioms replace the clang-tidy/clang-format contracts.
    - Merge useful entries from the existing `.claude/settings.local.json`.
+   - Later renamed to `AGENTS.md`, with performance discipline rules for every
+     performance change (measure musl first, keep glibc, macOS and Windows from
+     regressing).
 7. **Claim the crates.io name: publish `yet-another-make` 0.0.1** (infra)
    - Publish a real, minimal release: a working `yam --version` and `yam init`, and a
      README that states the project's status.
@@ -381,6 +384,10 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       build. Hash each target's shared compile flags once, build a compile command
       only when it runs, `stat` each file once per build, and prefetch the `stat`s
       in parallel.
+    - Follow-up #69: cut the small copies and allocations left on the no-op path:
+      string tables in one buffer, records keyed by path id, smaller command hashes,
+      an allocation-free prefetch that overlaps startup, shared buffers and module
+      names, and mimalloc's `no_thp`. Static musl ends within 0–6% of glibc.
 28. **Perf gate: beat ninja** (bench, perf)
     - For every #19 scenario, both styles (modules and legacy) and every size (100,
       1k, 10k):

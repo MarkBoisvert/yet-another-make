@@ -16,6 +16,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// A file to scan, with the compile command it would be built with.
@@ -29,19 +31,24 @@ pub struct ScanJob {
     pub arguments: Vec<OsString>,
 }
 
+/// A module or partition name. Shared rather than copied: a no-op build loads
+/// every file's scan result, and the same few names (`std` above all) appear in
+/// most of them, so each distinct name is allocated once.
+pub type ModuleName = Arc<str>;
+
 /// What a file provides and requires.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Deps {
     /// The module or partition the file provides (`m`, `m:part`), if any.
     pub provides: Option<Provided>,
     /// The modules and partitions it imports, partitions qualified as `m:part`. An
     /// implementation unit (`module m;`) requires `m`.
-    pub requires: Vec<String>,
+    pub requires: Vec<ModuleName>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Provided {
-    pub name: String,
+    pub name: ModuleName,
     /// `false` for an internal partition (`module m:part;`).
     pub is_interface: bool,
 }
@@ -198,10 +205,14 @@ fn parse(json: &[u8]) -> Result<HashMap<String, Deps>, serde_json::Error> {
         .map(|rule| {
             let deps = Deps {
                 provides: rule.provides.into_iter().next().map(|p| Provided {
-                    name: p.logical_name,
+                    name: p.logical_name.into(),
                     is_interface: p.is_interface,
                 }),
-                requires: rule.requires.into_iter().map(|r| r.logical_name).collect(),
+                requires: rule
+                    .requires
+                    .into_iter()
+                    .map(|r| r.logical_name.into())
+                    .collect(),
             };
             (normalize(&rule.primary_output), deps)
         })

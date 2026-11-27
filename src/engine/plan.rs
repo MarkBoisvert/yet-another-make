@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::path::Path;
 
-use super::scan::Deps;
+use super::scan::{Deps, ModuleName};
 
 /// The `std` module, which the build compiles from libc++ itself.
 pub const STD_MODULE: &str = "std";
@@ -28,7 +28,7 @@ pub struct SourceFile {
 impl SourceFile {
     /// The module or partition the file provides.
     fn provides(&self) -> Option<&str> {
-        self.deps.provides.as_ref().map(|p| p.name.as_str())
+        self.deps.provides.as_ref().map(|p| &*p.name)
     }
 }
 
@@ -45,7 +45,7 @@ pub struct Step {
     /// Index into the files the plan was made from.
     pub file: usize,
     /// The module or partition the file provides.
-    pub provides: Option<String>,
+    pub provides: Option<ModuleName>,
 }
 
 /// Why a target's files can't be ordered. `target` reads like ``lib target `core` ``.
@@ -142,7 +142,7 @@ pub fn check_one_main(target: &str, mains: Vec<String>) -> Result<(), PlanError>
 pub fn plan<S: BuildHasher>(
     target: &str,
     files: &[SourceFile],
-    available: &HashSet<String, S>,
+    available: &HashSet<ModuleName, S>,
 ) -> Result<Plan, PlanError> {
     let mut provider_of: HashMap<&str, usize> = HashMap::new();
     for (index, file) in files.iter().enumerate() {
@@ -171,23 +171,23 @@ pub fn plan<S: BuildHasher>(
     let mut needs: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); files.len()];
     for (index, file) in files.iter().enumerate() {
         for module in &file.deps.requires {
-            match module.as_str() {
+            match &**module {
                 STD_MODULE => imports_std = true,
                 STD_COMPAT_MODULE => {
                     return Err(PlanError::StdCompat {
                         file: file.path.clone(),
                     });
                 }
-                _ => match provider_of.get(module.as_str()) {
+                _ => match provider_of.get(&**module) {
                     Some(&provider) => {
                         needs[index].insert(provider);
                     }
-                    None if available.contains(module) => {}
+                    None if available.contains(&**module) => {}
                     None => {
                         return Err(PlanError::UnknownModule {
                             target: target.to_string(),
                             file: file.path.clone(),
-                            module: module.clone(),
+                            module: module.to_string(),
                         });
                     }
                 },
@@ -243,7 +243,7 @@ fn order_providers(
         }
         steps.push(Step {
             file,
-            provides: files[file].provides().map(String::from),
+            provides: files[file].deps.provides.as_ref().map(|p| p.name.clone()),
         });
     }
 
@@ -303,7 +303,7 @@ mod tests {
                     name: name.trim_start_matches('~').into(),
                     is_interface: !name.starts_with('~'),
                 }),
-                requires: requires.iter().map(|r| (*r).to_string()).collect(),
+                requires: requires.iter().map(|r| (*r).into()).collect(),
             },
         }
     }
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn available_modules_satisfy_imports() {
         let files = [file("src/main.cpp", None, &["core"])];
-        let available = HashSet::from(["core".to_string()]);
+        let available = HashSet::from([ModuleName::from("core")]);
         let plan = plan("bin target `app`", &files, &available).unwrap();
         assert_eq!(plan.steps.len(), 1);
         assert!(!plan.imports_std);
