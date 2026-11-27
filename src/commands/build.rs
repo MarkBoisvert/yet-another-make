@@ -19,6 +19,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use rustc_hash::FxHashMap;
 
 use crate::cli::BuildArgs;
 use crate::engine::{
@@ -110,7 +111,10 @@ pub fn run(args: &BuildArgs) -> Result<()> {
 
     let targets = select(resolve_targets(&manifest, &root)?, args)?;
     let selected = select_files(&root, &targets, &tree)?;
-    let toolchain = Toolchain::discover()?;
+    let (toolchain, discovered) = Toolchain::discover_cached(caches.state.toolchain())?;
+    if let Some(discovered) = discovered {
+        caches.state.set_toolchain(discovered);
+    }
 
     style::status(
         "Building",
@@ -183,9 +187,6 @@ fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
         .then(|| builder.std_module());
 
     let mut progress = Progress::new(&nodes);
-    // The compiled module interfaces each node reads, directly or through the
-    // modules it imports.
-    let mut pcms: Vec<Vec<PathBuf>> = vec![Vec::new(); nodes.len()];
 
     let (send, receive) = mpsc::channel::<Finished>();
     let mut running: HashMap<usize, Finish> = HashMap::new();
@@ -198,12 +199,12 @@ fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
             let Some(id) = progress.next() else {
                 break;
             };
-            pcms[id] = reads(&nodes, id, &pcms, &prepared, builder, std_module.as_ref());
+            let pcms = imports(&nodes, id, &prepared, builder, std_module.as_ref());
             let context = NodeContext {
                 prepared: &prepared,
                 lib: lib.as_ref(),
                 std: std_module.as_ref(),
-                pcms: &pcms[id],
+                pcms: &pcms,
             };
             if matches!(nodes[id].action, Action::Compile { .. }) {
                 compiles += 1;
@@ -345,28 +346,30 @@ fn spawn(id: usize, job: Job, send: &mpsc::Sender<Finished>, verbose: bool) -> F
     job.finish
 }
 
-/// The compiled interfaces node `id` reads: those of the nodes it needs, and what
-/// they read in turn. Each need's list is already known, since it ran first.
-fn reads(
+/// The compiled interfaces node `id` imports directly. Those are the only `.pcm`
+/// inputs its staleness needs: Clang records the signature of each module a `.pcm`
+/// imports in the `.pcm` itself, so a change anywhere below a direct import changes
+/// that import's bytes too, and an interface that comes out byte-identical means
+/// nothing below it changed.
+fn imports(
     nodes: &[engine::Node],
     id: usize,
-    pcms: &[Vec<PathBuf>],
     prepared: &[Prepared<'_>],
     builder: &Builder<'_>,
     std: Option<&StdModule>,
 ) -> Vec<PathBuf> {
-    let mut reads = BTreeSet::new();
+    let mut pcms = Vec::with_capacity(nodes[id].needs.len());
     for &need in &nodes[id].needs {
         match nodes[need].action {
-            Action::Std => reads.extend(std.map(|std| std.pcm.clone())),
+            Action::Std => pcms.extend(std.map(|std| std.pcm.clone())),
             Action::Compile { target, step } => {
-                reads.extend(builder.pcm_path(&prepared[target], step));
-                reads.extend(pcms[need].iter().cloned());
+                pcms.extend(builder.pcm_path(&prepared[target], step));
             }
             Action::Archive { .. } | Action::Link { .. } => {}
         }
     }
-    reads.into_iter().collect()
+    pcms.sort();
+    pcms
 }
 
 /// What a node's job needs to know beyond the node itself.
@@ -374,7 +377,7 @@ struct NodeContext<'a, 't> {
     prepared: &'a [Prepared<'t>],
     lib: Option<&'a Lib>,
     std: Option<&'a StdModule>,
-    /// The compiled interfaces this node reads.
+    /// The compiled interfaces this node imports directly.
     pcms: &'a [PathBuf],
 }
 
@@ -473,8 +476,8 @@ fn print_output(output: &[(Vec<u8>, Vec<u8>)]) {
 /// build fails, and journaled as jobs finish, so a killed build keeps its progress.
 struct Caches {
     state: State,
-    /// Header contents hashes for this build, so each header is read once.
-    header_hashes: HashMap<PathBuf, Option<blake3::Hash>>,
+    /// Header contents hashes for this build, by the header's recorded path.
+    header_hashes: FxHashMap<String, Option<blake3::Hash>>,
     /// Whether writing the journal already failed, so that's reported once.
     journal_failed: bool,
 }
@@ -487,7 +490,7 @@ impl Caches {
         }
         Self {
             state,
-            header_hashes: HashMap::new(),
+            header_hashes: FxHashMap::default(),
             journal_failed: false,
         }
     }
@@ -506,24 +509,25 @@ impl Caches {
 
     /// The scan key for a file, using the headers `object` was last compiled with.
     fn key(&mut self, root: &Path, file: &FileKey, object: &Path) -> Key {
-        let headers = self.state.headers.get(object).to_vec();
-        self.key_with(root, file, &headers)
+        let headers = self.state.headers.get(object);
+        let hashes = header_hashes(
+            &mut self.header_hashes,
+            &mut self.state.outputs,
+            root,
+            headers,
+        );
+        scan_key(file, headers, hashes)
     }
 
     /// The scan key for a file compiled with `headers`.
     fn key_with(&mut self, root: &Path, file: &FileKey, headers: &[String]) -> Key {
-        let hashes: Vec<Option<blake3::Hash>> = headers
-            .iter()
-            .map(|header| {
-                let path = root.join(header);
-                *self.header_hashes.entry(path).or_insert_with_key(|path| {
-                    fs::read(path).ok().map(|bytes| blake3::hash(&bytes))
-                })
-            })
-            .collect();
-        let pairs: Vec<engine::HeaderHash<'_>> =
-            headers.iter().map(String::as_str).zip(hashes).collect();
-        Key::new(&file.flags, &file.contents, &pairs)
+        let hashes = header_hashes(
+            &mut self.header_hashes,
+            &mut self.state.outputs,
+            root,
+            headers,
+        );
+        scan_key(file, headers, hashes)
     }
 
     fn save(&mut self) {
@@ -531,6 +535,32 @@ impl Caches {
             style::warning(format!("couldn't save the build state: {err}"));
         }
     }
+}
+
+/// The contents hash of each of `headers`, each looked up once per build.
+fn header_hashes(
+    memo: &mut FxHashMap<String, Option<blake3::Hash>>,
+    outputs: &mut engine::Outputs,
+    root: &Path,
+    headers: &[String],
+) -> Vec<Option<blake3::Hash>> {
+    headers
+        .iter()
+        .map(|header| {
+            if let Some(&hash) = memo.get(header.as_str()) {
+                return hash;
+            }
+            let hash = outputs.contents(&root.join(header));
+            memo.insert(header.clone(), hash);
+            hash
+        })
+        .collect()
+}
+
+fn scan_key(file: &FileKey, headers: &[String], hashes: Vec<Option<blake3::Hash>>) -> Key {
+    let pairs: Vec<engine::HeaderHash<'_>> =
+        headers.iter().map(String::as_str).zip(hashes).collect();
+    Key::new(&file.flags, &file.contents, &pairs)
 }
 
 /// What a file's scan key is made of, apart from its headers.
@@ -919,11 +949,14 @@ impl Builder<'_> {
             );
             for file in files {
                 let source = self.root.join(file);
-                let contents =
-                    fs::read(&source).with_context(|| format!("failed to read `{file}`"))?;
+                let contents = caches
+                    .state
+                    .outputs
+                    .contents(&source)
+                    .with_context(|| format!("failed to read `{file}`"))?;
                 let file_key = FileKey {
                     flags: flags.clone(),
-                    contents: blake3::hash(&contents),
+                    contents,
                 };
                 let output = object_file(&obj_dir, file);
                 let key = caches.key(self.root, &file_key, &output);
@@ -1091,14 +1124,14 @@ impl Builder<'_> {
             .arg(&object);
         let command = command_hash(&self.tools(), &compile);
 
-        let headers = self.caches.borrow().state.headers.get(&object).to_vec();
-        let inputs = self.compile_inputs(&source, &headers, pcms);
-        let fresh = self
-            .caches
-            .borrow_mut()
-            .state
-            .outputs
-            .is_fresh(&object, command, &inputs);
+        let fresh = {
+            let mut caches = self.caches.borrow_mut();
+            let state = &mut caches.state;
+            let inputs = std::iter::once(source.clone())
+                .chain(state.headers.get(&object).iter().map(|h| self.root.join(h)))
+                .chain(pcms.iter().cloned());
+            state.outputs.is_fresh(&object, command, inputs)
+        };
         if fresh && pcm.as_ref().is_none_or(|pcm| pcm.exists()) {
             return Ok(None);
         }
@@ -1601,7 +1634,8 @@ mod tests {
         let state = fs::read(dir.join("target/Debug/.yam/state")).unwrap();
         let has = |needle: &str| state.windows(needle.len()).any(|w| w == needle.as_bytes());
         assert!(has("src/config.h"), "the header isn't recorded");
-        assert!(!has("c++/v1"), "toolchain headers aren't recorded");
+        // The cached toolchain names libc++'s directory, but not a header in it.
+        assert!(!has("v1/cstdio"), "toolchain headers aren't recorded");
 
         // The source didn't change, but its header did, so it's scanned again and
         // now needs `std.pcm`.
@@ -1782,6 +1816,47 @@ mod tests {
             "the identical object didn't re-archive"
         );
         assert_eq!(run_binary(&exe(&dir, "Release", "same")), "3\n");
+    }
+
+    /// Only direct `.pcm` imports are staleness inputs, so a change two imports down
+    /// must still reach `main` through the interfaces in between.
+    #[test]
+    fn a_change_deep_in_the_import_chain_reaches_every_importer() {
+        if !have_toolchain() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("chain");
+        let base = |value: i32| {
+            format!("export module chain.base;\n\nexport inline int base() {{ return {value}; }}\n")
+        };
+        write(&dir.join("src/base.cppm"), &base(1));
+        write(
+            &dir.join("src/mid.cppm"),
+            "export module chain.mid;\nimport chain.base;\n\nexport inline int mid() { return base() * 10; }\n",
+        );
+        write(
+            &dir.join("src/lib.cppm"),
+            "export module chain;\nexport import chain.mid;\n",
+        );
+        write(
+            &dir.join("src/main.cpp"),
+            "import std;\nimport chain;\n\nint main() { std::println(\"{}\", mid()); }\n",
+        );
+        write(&dir.join("Yam.toml"), "[project]\nname = \"chain\"\n");
+        run(&build_args(&dir)).unwrap();
+        assert_eq!(run_binary(&exe(&dir, "Debug", "chain")), "10\n");
+
+        // `main` imports only `chain`, which reaches `chain.base` through `chain.mid`.
+        write(&dir.join("src/base.cppm"), &base(2));
+        let before = outputs(&dir);
+        run(&build_args(&dir)).unwrap();
+        let rebuilt = rebuilt(&before, &outputs(&dir));
+        assert!(
+            rebuilt.contains(&"obj/chain/bin/chain/src/main.cpp.o".to_string()),
+            "{rebuilt:?}"
+        );
+        assert_eq!(run_binary(&exe(&dir, "Debug", "chain")), "20\n");
     }
 
     #[test]

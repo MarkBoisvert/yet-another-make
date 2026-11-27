@@ -50,6 +50,10 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
    tool comes from an override (`YAM_CXX`, `YAM_CLANG_SCAN_DEPS`), then the bundled
    toolchain, then `PATH`; `clang-scan-deps` is first looked for next to `clang++`.
    `std.cppm` comes from `clang++ -print-file-name=libc++.modules.json`.
+   Discovery spawns three processes, so its result is kept in the state file and
+   reused while a fingerprint of what it looked at still matches (#27): the
+   overrides, `PATH`, the mtime of every directory searched, and the stat of each
+   tool and libc++ file found. Checking it is a few dozen `stat` calls.
 4. **Compute each project's standard** (see
    [One standard per project](#one-standard-per-project--decided)).
 5. **Ensure a `std.pcm`** for each distinct standard in use (see [std.pcm](#stdpcm--decided)).
@@ -192,14 +196,23 @@ An output is stale if any of these hold:
 - its set of inputs changed
 - any input's blake3 contents hash differs from the one it was built from
 
-Inputs are the source, the project headers from its last depfile (#23), and every
-compiled interface it reads, directly or through the modules it imports, including
-`std.pcm`; for an archive, its objects; for a link, its objects, `std.o`, the library's
-archive and any library files named in `links`.
+Inputs are the source, the project headers from its last depfile (#23), and the
+compiled interfaces it imports directly, including `std.pcm`; for an archive, its
+objects; for a link, its objects, `std.o`, the library's archive and any library files
+named in `links`.
+
+- **Direct imports are enough** (#27). Clang records the signature of every module a
+  `.pcm` imports inside the `.pcm`, so any change below a direct import, even an
+  inline function body two modules down, changes that import's bytes as well. And an
+  interface that comes out byte-identical means nothing below it changed. Listing
+  every transitive interface instead made a 1k-unit modules no-op ~650 ms, since
+  most files sit above most of the graph.
 
 - **`stat` first.** Each input's mtime and size are compared with the last time yam
   saw the file; only when they moved is it read and hashed. So a no-op build is `stat`
   calls alone, and `touch`, `git checkout` and a save without changes rebuild nothing.
+  The scan key's source and header hashes come from the same table, so the scan
+  doesn't read unchanged files either.
 - **Inputs are recorded as they were checked,** before the step ran. A file edited
   while it was being compiled is seen as changed by the next build.
 - **Restat, like ninja's:** an importer compares a `.pcm`'s contents, not its mtime, so
@@ -230,6 +243,7 @@ before the source walk (`src/engine/state.rs`). It's a hand-rolled binary format
     - scan results, keyed on contents, headers and flags (#22)
     - header dependencies from depfiles, by object (#23)
     - directory listings: mtime plus entries, for the source walk (#20)
+    - the discovered toolchain and its fingerprint (#27)
   - a blake3 checksum of everything before it
 - **Errors:** a missing file is an empty state. A corrupt, truncated or other-version
   file is discarded with a `note:`, and the build starts over. Never a crash: every
@@ -319,14 +333,15 @@ each scenario with `hyperfine`. There are two styles: **modules** (`import std`,
 | `cold` | clean build | Reported, not gated (compiling dominates) |
 
 **M2 isn't done until every gate passes at every size, in both styles.** Results and the machine they
-ran on are recorded in `docs/bench.md`. #27 profiles the no-op path (`perf`,
-`cargo flamegraph`) for allocations and `stat` cost, and checks that mimalloc beats
-the platform allocator on each OS.
+ran on are recorded in `docs/bench.md`, including #27's no-op profile and allocator
+comparison.
 
 ## Open questions
 
-- **Parallel `stat`:** whether parallel `stat` calls on the no-op path beat a
-  sequential walk on typical filesystems. Measured in #27.
+- **Parallel `stat`:** #27 measured 5,000 `stat` calls (a 1k-unit modules no-op) at
+  ~4–5 ms sequentially and ~1.5–2 ms on 4 threads, on ext4 under WSL2: about 10% of
+  that no-op. Not done yet; #28 decides at 10k units whether it's worth the
+  complexity.
 - **`std.compat.pcm`:** built only when some file imports `std.compat`, or always.
 - **File watching** (inotify or FSEvents, to skip the `stat` walk entirely): a
   possible later optimization. Out of scope until the gates in #28 pass without it.

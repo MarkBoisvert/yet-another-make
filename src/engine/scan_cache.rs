@@ -30,18 +30,23 @@ impl Key {
     /// hashed as `flags`, and last compiled with `headers`.
     #[must_use]
     pub fn new(flags: &FlagsHash, contents: &blake3::Hash, headers: &[HeaderHash<'_>]) -> Self {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(flags.0.as_bytes());
-        hasher.update(contents.as_bytes());
+        // Gathered into one buffer and hashed once: a file can have hundreds of
+        // headers, and many tiny `update` calls cost more than the hashing.
+        let mut bytes = Vec::with_capacity(64 + headers.len() * 64);
+        bytes.extend_from_slice(flags.0.as_bytes());
+        bytes.extend_from_slice(contents.as_bytes());
         for (path, hash) in headers {
-            hasher.update(b"\0");
-            hasher.update(path.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(path.as_bytes());
             match hash {
-                Some(hash) => hasher.update(b"=").update(hash.as_bytes()),
-                None => hasher.update(b"!"),
-            };
+                Some(hash) => {
+                    bytes.push(b'=');
+                    bytes.extend_from_slice(hash.as_bytes());
+                }
+                None => bytes.push(b'!'),
+            }
         }
-        Self(*hasher.finalize().as_bytes())
+        Self(*blake3::hash(&bytes).as_bytes())
     }
 }
 

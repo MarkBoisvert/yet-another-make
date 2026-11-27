@@ -11,6 +11,10 @@
 //! to the chosen `clang++`, so both come from the same install. `clang++` must be
 //! Clang 22 or newer, and `clang-scan-deps` must have the same major version.
 //! `llvm-ar` is found next to `clang++` too, falling back to `PATH` and then `ar`.
+//!
+//! Discovery runs `clang++` and `clang-scan-deps` (three process spawns), so a build
+//! reuses the last build's result while nothing discovery looked at has changed: see
+//! [`Toolchain::discover_cached`].
 
 mod std_modules;
 
@@ -20,6 +24,7 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 
 pub use std_modules::{ModuleSource, StdModules};
 
@@ -202,10 +207,37 @@ impl Toolchain {
     /// Fails if a tool is missing or too old, an override points at nothing usable,
     /// or libc++'s module sources can't be found.
     pub fn discover() -> Result<Self, ToolchainError> {
+        Self::discover_in(&Search::from_env())
+    }
+
+    /// Like [`Self::discover`], but reuses `cached` (the last build's result) when
+    /// its fingerprint still matches, which spawns no processes. Returns the
+    /// toolchain, and a new cache entry when discovery had to run.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::discover`], when the cache doesn't match.
+    pub fn discover_cached(
+        cached: Option<&Cached>,
+    ) -> Result<(Self, Option<Cached>), ToolchainError> {
         let search = Search::from_env();
-        let cxx = find_cxx(&search, &run_version)?;
-        let scan_deps = find_scan_deps(&search, &cxx, &run_version)?;
-        let ar = find_archiver(&search, &cxx)?;
+        if let Some(cached) = cached
+            && cached.fingerprint == fingerprint(&search, &cached.toolchain)
+        {
+            return Ok((cached.toolchain.clone(), None));
+        }
+        let toolchain = Self::discover_in(&search)?;
+        let entry = Cached {
+            fingerprint: fingerprint(&search, &toolchain),
+            toolchain: toolchain.clone(),
+        };
+        Ok((toolchain, Some(entry)))
+    }
+
+    fn discover_in(search: &Search) -> Result<Self, ToolchainError> {
+        let cxx = find_cxx(search, &run_version)?;
+        let scan_deps = find_scan_deps(search, &cxx, &run_version)?;
+        let ar = find_archiver(search, &cxx)?;
         let std_modules = std_modules::locate(&cxx)?;
         Ok(Self {
             cxx,
@@ -214,6 +246,78 @@ impl Toolchain {
             std_modules,
         })
     }
+}
+
+/// A discovered toolchain, kept in the build state file, with a fingerprint of
+/// everything discovery depended on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cached {
+    pub fingerprint: [u8; 32],
+    pub toolchain: Toolchain,
+}
+
+/// A hash of what discovering `toolchain` under `search` depended on:
+/// - the search itself: the overrides, the bundled directory and `PATH`;
+/// - the modification time of every directory searched, so a tool installed,
+///   removed or relinked there (package managers rename files into place) changes it;
+/// - the stat of each file found, and of the symlink to it, so an upgrade in place
+///   changes it.
+///
+/// It costs a few dozen `stat` calls, against three process spawns for discovery.
+fn fingerprint(search: &Search, toolchain: &Toolchain) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"yam-toolchain\0");
+    let mut field = |bytes: &[u8]| {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    let os = |value: &Option<OsString>| value.as_ref().map(|v| v.as_encoded_bytes().to_vec());
+    field(&os(&search.cxx_override).unwrap_or_default());
+    field(&os(&search.scan_deps_override).unwrap_or_default());
+    field(&[u8::from(search.bundled_dir.is_some())]);
+
+    let (_, sibling_dirs) = siblings(&toolchain.cxx, "");
+    let dirs = search
+        .bundled_dir
+        .iter()
+        .chain(&search.path)
+        .chain(&sibling_dirs);
+    for dir in dirs {
+        field(dir.as_os_str().as_encoded_bytes());
+        field(&stat_bytes(fs::metadata(dir)));
+    }
+
+    let modules = &toolchain.std_modules;
+    let files = [
+        &toolchain.cxx.path,
+        &toolchain.scan_deps.path,
+        &toolchain.ar,
+        &modules.manifest,
+        &modules.std.source,
+    ]
+    .into_iter()
+    .chain(modules.std_compat.as_ref().map(|m| &m.source));
+    for file in files {
+        field(file.as_os_str().as_encoded_bytes());
+        field(&stat_bytes(fs::metadata(file)));
+        field(&stat_bytes(fs::symlink_metadata(file)));
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// A file's modification time and size as bytes, or nothing if it's missing.
+fn stat_bytes(meta: std::io::Result<fs::Metadata>) -> Vec<u8> {
+    let Ok(meta) = meta else {
+        return Vec::new();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |time| time.as_nanos());
+    let mut bytes = mtime.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&meta.len().to_le_bytes());
+    bytes
 }
 
 /// Runs a tool's `--version`. Tests substitute a fake that reads the file instead.
@@ -638,6 +742,96 @@ mod tests {
         .unwrap();
         let err = find_archiver(&search(&[]), &lone).unwrap_err().to_string();
         assert!(err.contains("llvm-22"), "{err}");
+    }
+
+    /// A fake install in `temp/llvm`, found through a `PATH` of `temp/bin` and it.
+    fn fake_install(temp: &Path) -> (Search, Toolchain) {
+        let llvm = temp.join("llvm");
+        let clang = tool(&llvm, "clang++", "22.1.8");
+        let scan = tool(&llvm, "clang-scan-deps", "22.1.8");
+        let ar = tool(&llvm, "llvm-ar", "");
+        let manifest = llvm.join("libc++.modules.json");
+        let std = llvm.join("std.cppm");
+        fs::write(&manifest, "{}").unwrap();
+        fs::write(&std, "export module std;").unwrap();
+        fs::create_dir_all(temp.join("bin")).unwrap();
+        let search = search(&[&temp.join("bin"), &llvm]);
+        let toolchain = Toolchain {
+            cxx: check(&clang, &any_version(), &fake_probe).unwrap(),
+            scan_deps: check(&scan, &any_version(), &fake_probe).unwrap(),
+            ar,
+            std_modules: StdModules {
+                manifest,
+                std: ModuleSource {
+                    source: std,
+                    system_include_dirs: Vec::new(),
+                },
+                std_compat: None,
+            },
+        };
+        (search, toolchain)
+    }
+
+    #[test]
+    fn the_fingerprint_holds_until_something_discovery_saw_changes() {
+        let temp = tempdir().unwrap();
+        let (search, toolchain) = fake_install(temp.path());
+        let first = fingerprint(&search, &toolchain);
+        assert_eq!(fingerprint(&search, &toolchain), first);
+
+        // A replaced compiler.
+        let clang = &toolchain.cxx.path;
+        fs::write(clang, "Ubuntu clang version 22.1.9 (fake, upgraded)\n").unwrap();
+        let upgraded = fingerprint(&search, &toolchain);
+        assert_ne!(upgraded, first);
+
+        // A new tool in a directory on `PATH`, which could shadow the one found. The
+        // directory's mtime is set by hand so the test doesn't depend on the clock's
+        // resolution; Windows can't open a directory to do that.
+        #[cfg(unix)]
+        {
+            let file = fs::File::options().write(true).open(clang).unwrap();
+            file.set_modified(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+            let settled = fingerprint(&search, &toolchain);
+            tool(&temp.path().join("bin"), "clang++", "23.1.0");
+            let bin = fs::File::open(temp.path().join("bin")).unwrap();
+            bin.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7))
+                .unwrap();
+            assert_ne!(fingerprint(&search, &toolchain), settled);
+        }
+
+        // A different override or `PATH`.
+        let mut overridden = search.clone();
+        overridden.cxx_override = Some("clang++".into());
+        assert_ne!(
+            fingerprint(&overridden, &toolchain),
+            fingerprint(&search, &toolchain)
+        );
+        let mut shorter = search.clone();
+        shorter.path.pop();
+        assert_ne!(
+            fingerprint(&shorter, &toolchain),
+            fingerprint(&search, &toolchain)
+        );
+    }
+
+    /// A second build reuses the cached toolchain, and a stale cache is replaced.
+    #[test]
+    fn discovery_reuses_a_matching_cache() {
+        let Ok((toolchain, Some(cached))) = Toolchain::discover_cached(None) else {
+            return;
+        };
+        assert_eq!(cached.toolchain, toolchain);
+        let (again, none) = Toolchain::discover_cached(Some(&cached)).unwrap();
+        assert_eq!((again, none), (toolchain.clone(), None));
+
+        let stale = Cached {
+            fingerprint: [0; 32],
+            toolchain: toolchain.clone(),
+        };
+        let (_, replaced) = Toolchain::discover_cached(Some(&stale)).unwrap();
+        assert_eq!(replaced, Some(cached));
     }
 
     fn any_version() -> Requirement<'static> {

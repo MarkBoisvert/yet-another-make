@@ -57,6 +57,54 @@ cargo run -p bench --release -- report   # print the tables below
 | `root-iface` | the interface everything depends on | everything |
 | `add-unit` | a new unit used by `main` | the new unit and `main` (CMake reconfigures) |
 
+## No-op profile (#27)
+
+Measured on 2026-11-27 with `hyperfine -N` (30–40 runs) on 1k-unit projects, on the
+same laptop as the baseline (ext4 under WSL2). There's no `perf` on this machine, so
+the breakdown comes from timing each phase of `yam build`.
+
+| No-op, 1k units | before #27 | after #27 | `ninja` alone (baseline) |
+|---|---|---|---|
+| modules | 666 ms | 27 ms | 54 ms |
+| legacy | 110 ms | 29 ms | 35 ms |
+
+Where the time went, and what changed:
+- **Modules staleness, ~620 ms:** every compile listed every compiled interface below
+  it as an input, and most files sit above most of the graph. Now only direct
+  imports are inputs (see [build.md](build.md#staleness--decided-24)).
+- **Toolchain discovery, ~36 ms:** three process spawns on every build. Now cached in
+  the state file behind a fingerprint, which takes about 0.1 ms to check.
+- **Legacy scan keys, ~35 ms:** each no-op read and hashed every source and header,
+  and built each object's key from ~130 headers at a time. That's 130k lookups at
+  1k units, each allocating a path, plus four small blake3 updates per header. Now
+  the hashes come from the output record's stat table, each header is looked up
+  once per build, and each key is hashed in one call.
+- **Per-input allocations:** freshness checks no longer copy each object's header
+  list or allocate a string to look up each path.
+
+What's left at 1k units: loading the state file (~3–5 ms), the source walk and
+validation (~1 ms), scan-key checks (~5–9 ms), and the graph walk (~12–16 ms). About
+5 ms of that is `stat` calls; see [build.md](build.md#open-questions) on doing them
+in parallel.
+
+### Allocator
+
+All four builds of the same code, timed in one `hyperfine` run per project so they
+share the machine's conditions:
+
+| No-op, 1k units | glibc | glibc + mimalloc | musl (static) | musl + mimalloc |
+|---|---|---|---|---|
+| modules | 31.7 ms ± 6.2 | 26.3 ms ± 1.0 | 50.0 ms ± 3.9 | 37.9 ms ± 1.0 |
+| legacy | 36.5 ms ± 2.0 | 29.4 ms ± 0.7 | 83.6 ms ± 7.5 | 52.2 ms ± 2.3 |
+
+- **Linux:** mimalloc wins with both C libraries, by 17–19% over glibc's allocator
+  and 24–38% over musl's. So it stays on every target.
+- **The static musl build is slower even with mimalloc:** 44% slower than glibc on
+  modules and 78% on legacy. Nearly all of the gap is user-space CPU, not system
+  time, and its cause hasn't been found yet. It matters for #8's release binaries and
+  #28's gates: musl + mimalloc misses ninja's 35 ms legacy no-op.
+- **macOS and Windows** haven't been measured yet.
+
 ## Baseline: CMake + ninja
 
 Measured on 2026-10-11 with `bench run` defaults. yam's column fills in from #20 on.
