@@ -377,6 +377,10 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Follow-up #65: intern header paths, so a no-op build stops joining, comparing
       and copying them per include. This mainly fixes the static musl build, whose
       generic `memcpy`/`memcmp` made it much slower than glibc.
+    - Follow-up #67: tune the no-op path for static musl + mimalloc, the Linux release
+      build. Hash each target's shared compile flags once, build a compile command
+      only when it runs, `stat` each file once per build, and prefetch the `stat`s
+      in parallel.
 28. **Perf gate: beat ninja** (bench, perf)
     - For every #19 scenario, both styles (modules and legacy) and every size (100,
       1k, 10k):

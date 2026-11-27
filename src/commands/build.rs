@@ -22,8 +22,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::BuildArgs;
 use crate::engine::{
-    self, Action, CommandHash, Deps, FlagsHash, GraphTarget, HeaderDigest, HeaderRecord, Key, Plan,
-    STD_MODULE, ScanJob, SourceFile, State,
+    self, Action, CommandHash, CommandHasher, Deps, FlagsHash, GraphTarget, HeaderDigest,
+    HeaderRecord, Key, Plan, STD_MODULE, ScanJob, SourceFile, State,
 };
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
@@ -184,6 +184,10 @@ fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
         .iter()
         .any(|n| n.action == Action::Std)
         .then(|| builder.std_module());
+    let flags: Vec<CompileFlags> = prepared
+        .iter()
+        .map(|p| builder.compile_flags(p, std_module.as_ref(), Builder::lib_for(p, lib.as_ref())))
+        .collect();
 
     let mut progress = Progress::new(&nodes);
 
@@ -198,9 +202,10 @@ fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
             let Some(id) = progress.next() else {
                 break;
             };
-            let pcms = imports(&nodes, id, &prepared, builder, std_module.as_ref());
+            let pcms = imports(&nodes, id, &prepared, std_module.as_ref());
             let context = NodeContext {
                 prepared: &prepared,
+                flags: &flags,
                 lib: lib.as_ref(),
                 std: std_module.as_ref(),
                 pcms: &pcms,
@@ -350,34 +355,82 @@ fn spawn(id: usize, job: Job, send: &mpsc::Sender<Finished>, verbose: bool) -> F
 /// imports in the `.pcm` itself, so a change anywhere below a direct import changes
 /// that import's bytes too, and an interface that comes out byte-identical means
 /// nothing below it changed.
-fn imports(
+fn imports<'a>(
     nodes: &[engine::Node],
     id: usize,
-    prepared: &[Prepared<'_>],
-    builder: &Builder<'_>,
-    std: Option<&StdModule>,
-) -> Vec<PathBuf> {
+    prepared: &'a [Prepared<'_>],
+    std: Option<&'a StdModule>,
+) -> Vec<Interned<'a>> {
     let mut pcms = Vec::with_capacity(nodes[id].needs.len());
     for &need in &nodes[id].needs {
         match nodes[need].action {
-            Action::Std => pcms.extend(std.map(|std| std.pcm.clone())),
+            Action::Std => pcms.extend(std.map(|std| std.pcm.as_ref())),
             Action::Compile { target, step } => {
-                pcms.extend(builder.pcm_path(&prepared[target], step));
+                let file = prepared[target].plan.steps[step].file;
+                pcms.extend(
+                    prepared[target].paths[file]
+                        .pcm
+                        .as_ref()
+                        .map(Interned::from),
+                );
             }
             Action::Archive { .. } | Action::Link { .. } => {}
         }
     }
-    pcms.sort();
+    pcms.sort_by(|a, b| a.path.cmp(b.path));
     pcms
+}
+
+/// A path with its id in the output record, interned once per build.
+struct InternedPath {
+    path: PathBuf,
+    id: u32,
+}
+
+impl InternedPath {
+    fn new(path: PathBuf, outputs: &mut engine::Outputs) -> Self {
+        let id = outputs.intern(&path);
+        Self { path, id }
+    }
+
+    fn as_ref(&self) -> Interned<'_> {
+        Interned::from(self)
+    }
+}
+
+/// A borrowed [`InternedPath`].
+#[derive(Clone, Copy)]
+struct Interned<'a> {
+    path: &'a Path,
+    id: u32,
+}
+
+impl<'a> From<&'a InternedPath> for Interned<'a> {
+    fn from(interned: &'a InternedPath) -> Self {
+        Self {
+            path: &interned.path,
+            id: interned.id,
+        }
+    }
 }
 
 /// What a node's job needs to know beyond the node itself.
 struct NodeContext<'a, 't> {
     prepared: &'a [Prepared<'t>],
+    /// By target, the compile flags its files share.
+    flags: &'a [CompileFlags],
     lib: Option<&'a Lib>,
     std: Option<&'a StdModule>,
     /// The compiled interfaces this node imports directly.
-    pcms: &'a [PathBuf],
+    pcms: &'a [Interned<'a>],
+}
+
+/// The start of every compile command in a target: the compiler and the flags all
+/// its files share, with their hash so far. Worked out once per target, so a no-op
+/// build doesn't rebuild and rehash the same arguments for every file.
+struct CompileFlags {
+    args: Vec<OsString>,
+    hasher: CommandHasher,
 }
 
 /// A node's commands, run in order on a worker thread, and how the build records
@@ -568,6 +621,14 @@ fn resolve_header(
     info
 }
 
+/// A scanned file: its module dependencies, scan key parts, source and object.
+struct Scanned {
+    deps: Deps,
+    key: FileKey,
+    source: InternedPath,
+    object: PathBuf,
+}
+
 /// What a file's scan key is made of, apart from its headers.
 struct FileKey {
     flags: FlagsHash,
@@ -623,7 +684,18 @@ struct Prepared<'t> {
     files: Vec<SourceFile>,
     /// Each file's scan key parts, in the same order as `files`.
     keys: Vec<FileKey>,
+    /// Each file's paths, in the same order as `files`.
+    paths: Vec<FilePaths>,
     plan: Plan,
+}
+
+/// Where a file is and what compiling it writes, joined and interned once per build.
+struct FilePaths {
+    source: InternedPath,
+    object: InternedPath,
+    depfile: PathBuf,
+    /// Its compiled interface, if it provides a module.
+    pcm: Option<InternedPath>,
 }
 
 impl Prepared<'_> {
@@ -704,7 +776,7 @@ fn describe(target: &Target) -> String {
 
 /// The compiled `std` module, shared by every target at one standard.
 struct StdModule {
-    pcm: PathBuf,
+    pcm: InternedPath,
     object: PathBuf,
 }
 
@@ -748,7 +820,10 @@ impl Builder<'_> {
     fn std_module(&self) -> StdModule {
         let dir = self.out.join("std").join(self.std.as_str());
         StdModule {
-            pcm: dir.join("std.pcm"),
+            pcm: InternedPath::new(
+                dir.join("std.pcm"),
+                &mut self.caches.borrow_mut().state.outputs,
+            ),
             object: dir.join("std.o"),
         }
     }
@@ -766,20 +841,20 @@ impl Builder<'_> {
             .arg("--precompile")
             .arg(&std.source)
             .arg("-o")
-            .arg(&module.pcm);
+            .arg(&module.pcm.path);
         // Compiling a `.pcm` to an object reads no headers, so no `-stdlib`.
         let mut compile = Command::new(&self.toolchain.cxx.path);
         compile
             .arg(format!("-std={}", self.std.as_str()))
             .args(self.profile.flags())
             .arg("-c")
-            .arg(&module.pcm)
+            .arg(&module.pcm.path)
             .arg("-o")
             .arg(&module.object);
 
         // Until the build state file (#26), a stamp next to the outputs records what
         // they were built from.
-        let dir = module.pcm.parent().unwrap_or(&self.out).to_path_buf();
+        let dir = module.pcm.path.parent().unwrap_or(&self.out).to_path_buf();
         let stamp_path = dir.join("std.stamp");
         let stamp = [
             identity(&self.toolchain.cxx.path),
@@ -789,7 +864,7 @@ impl Builder<'_> {
             display(&compile),
         ]
         .join("\n");
-        let fresh = module.pcm.is_file()
+        let fresh = module.pcm.path.is_file()
             && module.object.is_file()
             && fs::read_to_string(&stamp_path).is_ok_and(|old| old == stamp);
         if fresh {
@@ -813,13 +888,13 @@ impl Builder<'_> {
                 Some(module) => self.std_job(module),
                 None => Ok(None),
             },
-            Action::Compile { target, step } => {
-                let prepared = &context.prepared[target];
-                let lib = context.lib.filter(|_| {
-                    prepared.target.kind == TargetKind::Bin && prepared.target.links_lib
-                });
-                self.compile_job(target, prepared, step, context.std, lib, context.pcms)
-            }
+            Action::Compile { target, step } => self.compile_job(
+                target,
+                &context.prepared[target],
+                step,
+                &context.flags[target],
+                context.pcms,
+            ),
             Action::Archive { target } => self.archive_job(&context.prepared[target]),
             Action::Link { target } => {
                 let prepared = &context.prepared[target];
@@ -884,11 +959,32 @@ impl Builder<'_> {
         let mut lib_modules = HashSet::new();
         let none = HashSet::new();
         for Selected { target, files } in selected {
-            let (files, keys): (Vec<SourceFile>, Vec<FileKey>) = files
+            let (_, module_dir) = self.target_dirs(target);
+            let mut caches = self.caches.borrow_mut();
+            let outputs = &mut caches.state.outputs;
+            let mut keys = Vec::with_capacity(files.len());
+            let mut paths = Vec::with_capacity(files.len());
+            let files: Vec<SourceFile> = files
                 .into_iter()
                 .zip(scanned.by_ref())
-                .map(|(path, (deps, key))| (SourceFile { path, deps }, key))
-                .unzip();
+                .map(|(path, scanned)| {
+                    let pcm = scanned.deps.provides.as_ref().map(|provided| {
+                        InternedPath::new(module_dir.join(pcm_name(&provided.name)), outputs)
+                    });
+                    paths.push(FilePaths {
+                        depfile: depfile_path(&scanned.object),
+                        object: InternedPath::new(scanned.object, outputs),
+                        source: scanned.source,
+                        pcm,
+                    });
+                    keys.push(scanned.key);
+                    SourceFile {
+                        path,
+                        deps: scanned.deps,
+                    }
+                })
+                .collect();
+            drop(caches);
             let available = if target.kind == TargetKind::Bin && target.links_lib {
                 &lib_modules
             } else {
@@ -910,6 +1006,7 @@ impl Builder<'_> {
                 target,
                 files,
                 keys,
+                paths,
                 plan,
             };
             if target.target.kind == TargetKind::Lib {
@@ -924,11 +1021,7 @@ impl Builder<'_> {
     /// scan cache when its contents, headers and flags are unchanged, otherwise from
     /// one `clang-scan-deps` run over the rest. A build where nothing changed starts
     /// no scanner at all.
-    fn scan(
-        &self,
-        selected: &[Selected<'_>],
-        lib_target: Option<&Target>,
-    ) -> Result<Vec<(Deps, FileKey)>> {
+    fn scan(&self, selected: &[Selected<'_>], lib_target: Option<&Target>) -> Result<Vec<Scanned>> {
         let toolchain = self.toolchain;
         let tools = format!(
             "{} {} {} {}",
@@ -938,8 +1031,11 @@ impl Builder<'_> {
             toolchain.cxx.version
         );
         let mut caches = self.caches.borrow_mut();
+        // Every file the last build recorded is about to be checked, starting with
+        // the sources here.
+        caches.state.outputs.prefetch(self.jobs);
 
-        let mut results: Vec<(Option<Deps>, FileKey)> = Vec::new();
+        let mut results: Vec<(Option<Deps>, FileKey, InternedPath, PathBuf)> = Vec::new();
         let mut misses = Vec::new();
         let mut jobs = Vec::new();
         for Selected { target, files } in selected {
@@ -953,11 +1049,11 @@ impl Builder<'_> {
                 std::iter::once(command.get_program()).chain(command.get_args()),
             );
             for file in files {
-                let source = self.root.join(file);
+                let source = InternedPath::new(self.root.join(file), &mut caches.state.outputs);
                 let contents = caches
                     .state
                     .outputs
-                    .contents(&source)
+                    .contents_of(source.id)
                     .with_context(|| format!("failed to read `{file}`"))?;
                 let file_key = FileKey {
                     flags: flags.clone(),
@@ -966,7 +1062,7 @@ impl Builder<'_> {
                 let output = object_file(&obj_dir, file);
                 let key = caches.key(self.root, &file_key, &output);
                 if let Some(deps) = caches.state.scan.get(key) {
-                    results.push((Some(deps), file_key));
+                    results.push((Some(deps), file_key, source, output));
                     continue;
                 }
                 create_parent(&output)?;
@@ -975,18 +1071,18 @@ impl Builder<'_> {
                     .map(ToOwned::to_owned)
                     .chain([
                         "-c".into(),
-                        source.clone().into_os_string(),
+                        source.path.clone().into_os_string(),
                         "-o".into(),
                         output.clone().into_os_string(),
                     ])
                     .collect();
                 misses.push((results.len(), key));
-                results.push((None, file_key));
                 jobs.push(ScanJob {
-                    source,
-                    output,
+                    source: source.path.clone(),
+                    output: output.clone(),
                     arguments,
                 });
+                results.push((None, file_key, source, output));
             }
         }
 
@@ -1011,7 +1107,14 @@ impl Builder<'_> {
         }
         Ok(results
             .into_iter()
-            .filter_map(|(deps, key)| Some((deps?, key)))
+            .filter_map(|(deps, key, source, object)| {
+                Some(Scanned {
+                    deps: deps?,
+                    key,
+                    source,
+                    object,
+                })
+            })
             .collect())
     }
 
@@ -1050,93 +1153,92 @@ impl Builder<'_> {
         )
     }
 
-    /// The object a target's plan step compiles to.
-    fn object(&self, prepared: &Prepared<'_>, step: usize) -> PathBuf {
-        let (obj_dir, _) = self.target_dirs(prepared.target);
-        let file = prepared.plan.steps[step].file;
-        object_file(&obj_dir, &prepared.files[file].path)
+    /// The library as `prepared`'s compiles and link use it: only a bin that links
+    /// it does.
+    fn lib_for<'l>(prepared: &Prepared<'_>, lib: Option<&'l Lib>) -> Option<&'l Lib> {
+        lib.filter(|_| prepared.target.kind == TargetKind::Bin && prepared.target.links_lib)
     }
 
-    /// The compiled interface a target's plan step writes, if its file provides a
-    /// module.
-    fn pcm_path(&self, prepared: &Prepared<'_>, step: usize) -> Option<PathBuf> {
-        let (_, module_dir) = self.target_dirs(prepared.target);
-        let module = prepared.plan.steps[step].provides.as_ref()?;
-        Some(module_dir.join(pcm_name(module)))
+    /// The compiler and flags every compile in `prepared` starts with, and their
+    /// hash so far.
+    fn compile_flags(
+        &self,
+        prepared: &Prepared<'_>,
+        std: Option<&StdModule>,
+        lib: Option<&Lib>,
+    ) -> CompileFlags {
+        let target = prepared.target;
+        let mut args: Vec<OsString> = vec![
+            self.toolchain.cxx.path.clone().into_os_string(),
+            format!("-std={}", self.std.as_str()).into(),
+            "-stdlib=libc++".into(),
+        ];
+        args.extend(self.profile.flags().iter().map(OsString::from));
+        if let Some(std) = std {
+            args.push(format!("-fmodule-file=std={}", std.pcm.path.display()).into());
+        }
+        let (_, module_dir) = self.target_dirs(target);
+        let own_modules = prepared.plan.steps.iter().any(|s| s.provides.is_some());
+        let module_dirs = own_modules
+            .then_some(&module_dir)
+            .into_iter()
+            .chain(lib.and_then(|lib| lib.module_dir.as_ref()));
+        for dir in module_dirs {
+            args.push(format!("-fprebuilt-module-path={}", dir.display()).into());
+        }
+        let include_dirs = target
+            .include_dirs
+            .iter()
+            .map(|dir| self.root.join(dir))
+            .chain(
+                lib.into_iter()
+                    .flat_map(|lib| lib.include_dirs.iter().cloned()),
+            );
+        for dir in include_dirs {
+            args.push(format!("-I{}", dir.display()).into());
+        }
+        let mut hasher = CommandHasher::new(&self.tools());
+        for arg in &args {
+            hasher.arg(arg);
+        }
+        CompileFlags { args, hasher }
+    }
+
+    /// The object a target's plan step compiles to.
+    fn object<'p>(prepared: &'p Prepared<'_>, step: usize) -> &'p Path {
+        &prepared.paths[prepared.plan.steps[step].file].object.path
     }
 
     /// The job compiling one file, unless its object (and interface) are fresh.
     /// `pcms` are the compiled interfaces it reads.
+    ///
+    /// A fresh file costs a hash of its last few arguments and a `stat` per input:
+    /// the command itself is only put together when it has to run.
     fn compile_job(
         &self,
         target_index: usize,
         prepared: &Prepared<'_>,
         step: usize,
-        std: Option<&StdModule>,
-        lib: Option<&Lib>,
-        pcms: &[PathBuf],
+        flags: &CompileFlags,
+        pcms: &[Interned<'_>],
     ) -> Result<Option<Job>> {
         let target = prepared.target;
-        let (_, module_dir) = self.target_dirs(target);
         let file = prepared.plan.steps[step].file;
-        let source = self.root.join(&prepared.files[file].path);
-        let object = self.object(prepared, step);
-        let pcm = self.pcm_path(prepared, step);
-        let depfile = depfile_path(&object);
-
-        let mut include_dirs: Vec<PathBuf> = target
-            .include_dirs
-            .iter()
-            .map(|dir| self.root.join(dir))
-            .collect();
-        let mut module_dirs = Vec::new();
-        if prepared.plan.steps.iter().any(|s| s.provides.is_some()) {
-            module_dirs.push(module_dir);
-        }
-        if let Some(lib) = lib {
-            include_dirs.extend(lib.include_dirs.iter().cloned());
-            module_dirs.extend(lib.module_dir.iter().cloned());
-        }
-
-        let mut compile = self.compile_command();
-        if let Some(std) = std {
-            compile.arg(format!("-fmodule-file=std={}", std.pcm.display()));
-        }
-        for dir in &module_dirs {
-            compile.arg(format!("-fprebuilt-module-path={}", dir.display()));
-        }
-        for dir in &include_dirs {
-            compile.arg(format!("-I{}", dir.display()));
-        }
-        if let Some(pcm) = &pcm {
-            compile.arg(format!("-fmodule-output={}", pcm.display()));
-            // `.cppm` is a module interface by its extension; anything else that
-            // declares a module needs saying so.
-            if !engine::has_extension(&prepared.files[file].path, "cppm") {
-                compile.args(["-x", "c++-module"]);
-            }
-        }
-        // The output is captured, so colors are asked for explicitly; printing it
-        // strips them again when they aren't wanted.
-        compile
-            .arg("-fdiagnostics-color=always")
-            .arg("-MMD")
-            .arg("-MF")
-            .arg(&depfile)
-            .arg("-c")
-            .arg(&source)
-            .arg("-o")
-            .arg(&object);
-        let command = command_hash(&self.tools(), &compile);
+        let paths = &prepared.paths[file];
+        // `.cppm` is a module interface by its extension; anything else that
+        // declares a module needs saying so.
+        let needs_language =
+            paths.pcm.is_some() && !engine::has_extension(&prepared.files[file].path, "cppm");
+        let command = compile_hash(flags, paths, needs_language);
 
         let fresh = {
             let mut caches = self.caches.borrow_mut();
             let Caches {
                 state, header_info, ..
             } = &mut *caches;
-            let headers = state.headers.get(&object);
+            let headers = state.headers.get(&paths.object.path);
             let mut inputs = Vec::with_capacity(1 + headers.len() + pcms.len());
-            inputs.push(state.outputs.intern(&source));
+            inputs.push(paths.source.id);
             for &id in headers {
                 let info = resolve_header(
                     header_info,
@@ -1147,16 +1249,45 @@ impl Builder<'_> {
                 );
                 inputs.push(info.path);
             }
-            inputs.extend(pcms.iter().map(|pcm| state.outputs.intern(pcm)));
-            state.outputs.is_fresh_ids(&object, command, &inputs)
+            inputs.extend(pcms.iter().map(|pcm| pcm.id));
+            state
+                .outputs
+                .is_fresh_ids(paths.object.id, command, &inputs)
+                && paths
+                    .pcm
+                    .as_ref()
+                    .is_none_or(|pcm| state.outputs.exists(pcm.id))
         };
-        if fresh && pcm.as_ref().is_none_or(|pcm| pcm.exists()) {
+        if fresh {
             return Ok(None);
         }
 
-        create_parent(&object)?;
-        if let Some(pcm) = &pcm {
-            create_parent(pcm)?;
+        let mut compile = Command::new(&flags.args[0]);
+        compile.args(&flags.args[1..]);
+        if let Some(pcm) = &paths.pcm {
+            let mut output = OsString::from("-fmodule-output=");
+            output.push(&pcm.path);
+            compile.arg(output);
+            if needs_language {
+                compile.args(["-x", "c++-module"]);
+            }
+        }
+        // The output is captured, so colors are asked for explicitly; printing it
+        // strips them again when they aren't wanted.
+        compile
+            .arg("-fdiagnostics-color=always")
+            .arg("-MMD")
+            .arg("-MF")
+            .arg(&paths.depfile)
+            .arg("-c")
+            .arg(&paths.source.path)
+            .arg("-o")
+            .arg(&paths.object.path);
+        debug_assert_eq!(command, command_hash(&self.tools(), &compile));
+
+        create_parent(&paths.object.path)?;
+        if let Some(pcm) = &paths.pcm {
+            create_parent(&pcm.path)?;
         }
         Ok(Some(Job {
             commands: vec![compile],
@@ -1164,11 +1295,11 @@ impl Builder<'_> {
             finish: Finish::Compile {
                 target: target_index,
                 file,
-                source,
-                object,
-                pcm,
-                depfile,
-                pcms: pcms.to_vec(),
+                source: paths.source.path.clone(),
+                object: paths.object.path.clone(),
+                pcm: paths.pcm.as_ref().map(|pcm| pcm.path.clone()),
+                depfile: paths.depfile.clone(),
+                pcms: pcms.iter().map(|pcm| pcm.path.to_path_buf()).collect(),
                 command,
             },
         }))
@@ -1225,16 +1356,16 @@ impl Builder<'_> {
     }
 
     /// A target's objects, in plan order.
-    fn objects(&self, prepared: &Prepared<'_>) -> Vec<PathBuf> {
+    fn objects(prepared: &Prepared<'_>) -> Vec<PathBuf> {
         (0..prepared.plan.steps.len())
-            .map(|step| self.object(prepared, step))
+            .map(|step| Self::object(prepared, step).to_path_buf())
             .collect()
     }
 
     /// The job archiving the library's objects, unless the archive is fresh.
     fn archive_job(&self, prepared: &Prepared<'_>) -> Result<Option<Job>> {
         let target = prepared.target;
-        let objects = self.objects(prepared);
+        let objects = Self::objects(prepared);
         let archive = self.out.join(format!("lib{}.a", target.name));
         let before = [OsString::from("rcs"), archive.clone().into_os_string()];
         let command = CommandHash::new(
@@ -1277,7 +1408,7 @@ impl Builder<'_> {
         lib: Option<&Lib>,
     ) -> Result<Option<Job>> {
         let target = prepared.target;
-        let mut objects = self.objects(prepared);
+        let mut objects = Self::objects(prepared);
         if let Some(std) = std {
             objects.push(std.object.clone());
         }
@@ -1383,6 +1514,30 @@ fn command_hash(tools: &str, command: &Command) -> CommandHash {
         tools,
         std::iter::once(command.get_program()).chain(command.get_args()),
     )
+}
+
+/// The hash of the compile [`Builder::compile_job`] runs for `paths`, without
+/// putting the command together: `flags`' hash so far plus the arguments that
+/// differ per file, written as [`CommandHasher::encoded`] runs. It must match
+/// [`command_hash`] of the full command, which debug builds check.
+fn compile_hash(flags: &CompileFlags, paths: &FilePaths, needs_language: bool) -> CommandHash {
+    let mut hasher = flags.hasher.clone();
+    if let Some(pcm) = &paths.pcm {
+        hasher
+            .encoded(b"\0-fmodule-output=")
+            .encoded(pcm.path.as_os_str().as_encoded_bytes());
+        if needs_language {
+            hasher.encoded(b"\0-x\0c++-module");
+        }
+    }
+    hasher
+        .encoded(b"\0-fdiagnostics-color=always\0-MMD\0-MF")
+        .arg(&paths.depfile)
+        .encoded(b"\0-c")
+        .arg(&paths.source.path)
+        .encoded(b"\0-o")
+        .arg(&paths.object.path)
+        .finish()
 }
 
 /// `<dir>/<source>.o`.

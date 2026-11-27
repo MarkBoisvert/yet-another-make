@@ -15,7 +15,7 @@ pub mod state;
 pub use entry::defines_main;
 pub use graph::{Action, GraphTarget, Node, graph};
 pub use headers::{HeaderRecord, headers_from_depfile};
-pub use outputs::{CommandHash, Outputs};
+pub use outputs::{CommandHash, CommandHasher, Outputs};
 pub use plan::{
     Plan, PlanError, STD_MODULE, SourceFile, Step, check_one_main, has_extension,
     is_interface_file, plan,

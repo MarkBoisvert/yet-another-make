@@ -217,6 +217,17 @@ named in `links`.
   each object's headers as ids. A build resolves each header id once, to its id in
   the output record and a digest of its path and contents, so checking an object's
   headers compares integers and its scan key hashes one digest per header.
+- **One `stat` per file per build** (#67). Whether a file's existence (an output) or its
+  contents (an input) is asked about first, the answer is kept for the rest of the
+  build, so an object that's both a compile's output and the archive's input is
+  `stat`ed once. Before the scan, every file the recorded outputs name is `stat`ed on
+  up to 8 threads (when there are at least 512 per thread); the checks that follow
+  find them done. A file a step writes is forgotten and checked again, as before.
+- **A fresh compile isn't put together** (#67). Each target's shared compile flags (`-std`,
+  profile flags, module and include directories) are built and hashed once, and each
+  file's paths are joined and interned once. Checking a file hashes only its last
+  few arguments on top of the target's hash; the `Command` is only built if the file
+  is stale. Debug builds check that this hash equals the full command's.
 - **Inputs are recorded as they were checked,** before the step ran. A file edited
   while it was being compiled is seen as changed by the next build.
 - **Restat, like ninja's:** an importer compares a `.pcm`'s contents, not its mtime, so
@@ -342,10 +353,6 @@ comparison.
 
 ## Open questions
 
-- **Parallel `stat`:** #27 measured 5,000 `stat` calls (a 1k-unit modules no-op) at
-  ~4–5 ms sequentially and ~1.5–2 ms on 4 threads, on ext4 under WSL2: about 10% of
-  that no-op. Not done yet; #28 decides at 10k units whether it's worth the
-  complexity.
 - **`std.compat.pcm`:** built only when some file imports `std.compat`, or always.
 - **File watching** (inotify or FSEvents, to skip the `stat` walk entirely): a
   possible later optimization. Out of scope until the gates in #28 pass without it.

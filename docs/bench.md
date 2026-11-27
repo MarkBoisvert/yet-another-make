@@ -84,8 +84,8 @@ Where the time went, and what changed:
 
 What's left at 1k units: loading the state file (~3–5 ms), the source walk and
 validation (~1 ms), scan-key checks (~5–9 ms), and the graph walk (~12–16 ms). About
-5 ms of that is `stat` calls; see [build.md](build.md#open-questions) on doing them
-in parallel.
+5 ms of that is `stat` calls, now done in parallel (see
+[Tuning for static musl + mimalloc](#tuning-for-static-musl--mimalloc-67)).
 
 ### Allocator
 
@@ -125,6 +125,48 @@ All four binaries were timed in one `hyperfine` run per project (with mimalloc):
 - **Modules didn't move:** those projects have no headers. Their remaining musl gap
   comes from hashing each compile command in many small blake3 updates, rebuilding
   target directory paths per node, formatting compiler arguments, and `stat` calls.
+  The next section fixes those.
+
+### Tuning for static musl + mimalloc (#67)
+
+Static musl + mimalloc is the Linux release build (#8), so it's what these numbers
+are tuned for. musl's `memcpy` is `rep movsq` for every size and its `memcmp` is a
+byte loop, so each small copy or compare costs far more than with glibc's SIMD
+versions. The fix is to make fewer of them, which helps glibc as well. Profiles of
+the musl build pointed to three changes:
+- **A fresh compile isn't put together.** Each no-op compile check built the whole
+  `clang++` command (about ten path joins and `format!` calls, each argument copied
+  into a `CString`) and hashed it in ~40 small blake3 updates. Now each target's
+  shared flags are built and hashed once, each file's paths are joined and interned
+  once, and a check hashes only the file's last few arguments, mostly as constant
+  runs. The command is only built for a file that runs.
+- **One `stat` per file per build.** Each object and `.pcm` was `stat`ed twice, once
+  as a compile's output and again as an input. A modules no-op made 8,052 `stat`
+  calls; now it makes about 5,000.
+- **Parallel `stat`:** before the scan, every file the recorded outputs name is
+  `stat`ed on up to 8 threads. This saved about 1.3 ms at 1k units; more than 8
+  threads measured no faster.
+
+mimalloc's setup of fresh pages is 13–15% of the musl profile. Turning off
+transparent huge pages (`MIMALLOC_ALLOW_THP=0`) cut resident memory from 37 MB to
+13 MB but didn't change the time, so mimalloc keeps its defaults.
+
+The same four binaries (before is #65), timed together, median of three
+`hyperfine` rounds of 50 runs each:
+
+| No-op, 1k units | glibc, before | glibc, after | musl, before | musl, after | `ninja` alone |
+|---|---|---|---|---|---|
+| legacy | 18.6 ms | 14.1 ms | 23.1 ms | 15.7 ms | 35 ms |
+| modules | 27.4 ms | 17.6 ms | 39.7 ms | 20.9 ms | 54 ms |
+
+- **musl is now within 11–19% of glibc,** down from 24–45%, and at 39–45% of
+  ninja's no-op time.
+- **Every scenario rebuilds the same files as before:** `touch`, `leaf-impl`,
+  `leaf-iface`, `impl-1pct`, `mid-iface` and `add-unit` each compiled the same
+  count with the old and new binaries, in both styles, and the build after each
+  compiled nothing. Existing build state carries over without a rebuild.
+- **What's left in the musl profile:** `stat` (~21%), mimalloc's fresh pages
+  (~14%), decoding the state file's strings, and the remaining small copies.
 
 
 ## Baseline: CMake + ninja
