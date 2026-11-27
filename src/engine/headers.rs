@@ -5,47 +5,58 @@
 //! own (libc++ alone is over a thousand per file). Toolchain headers change only with
 //! the toolchain, whose path and version are already part of every cache key.
 //!
-//! The record lives in `target/<Profile>/.yam/headers.json` until the binary build
-//! state file (#26) takes it over. Staleness (#24) will use it to decide what to
-//! recompile; for now it keeps the scan cache honest when a header changes.
+//! The record is part of the build state file ([`super::State`]). Staleness uses it
+//! to know each compile's inputs, and the scan cache to notice a header change.
 
 use std::collections::HashMap;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::store::{self, StoreError};
+use super::state::Record;
 use crate::manifest::slash_path;
-
-/// Bumped whenever the file layout changes.
-const FORMAT_VERSION: u32 = 1;
 
 /// Headers by object file, loaded from the last build and updated by this one.
 #[derive(Debug, Default)]
 pub struct HeaderRecord {
-    path: PathBuf,
     /// Object path → headers, each relative to the project root with `/` separators
     /// when inside it, otherwise absolute.
     entries: HashMap<String, Vec<String>>,
     changed: bool,
+    /// Records for the journal since it was last written.
+    pending: Vec<Record>,
 }
 
 impl HeaderRecord {
-    /// Load the record at `path`. A missing file is an empty record; an unreadable,
-    /// corrupt or outdated one is also empty, with the reason returned.
-    #[must_use]
-    pub fn load(path: &Path) -> (Self, Option<StoreError>) {
-        let mut record = Self {
-            path: path.to_path_buf(),
+    pub(super) fn from_entries(entries: HashMap<String, Vec<String>>) -> Self {
+        Self {
+            entries,
             ..Self::default()
-        };
-        match store::load(path, FORMAT_VERSION) {
-            Ok(entries) => record.entries = entries.unwrap_or_default(),
-            Err(err) => {
-                record.changed = true;
-                return (record, Some(err));
-            }
         }
-        (record, None)
+    }
+
+    pub(super) fn entries(&self) -> &HashMap<String, Vec<String>> {
+        &self.entries
+    }
+
+    pub(super) fn needs_save(&self) -> bool {
+        self.changed
+    }
+
+    pub(super) fn saved(&mut self) {
+        self.changed = false;
+    }
+
+    pub(super) fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
+    pub(super) fn take_pending(&mut self) -> Vec<Record> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Forget objects that no longer exist. Done only when the state is written
+    /// anyway, so a no-op build doesn't stat every object.
+    pub(super) fn prune(&mut self) {
+        self.entries.retain(|object, _| Path::new(object).exists());
     }
 
     /// The headers `object` was last compiled with; empty if it never was.
@@ -58,25 +69,13 @@ impl HeaderRecord {
     pub fn record(&mut self, object: &Path, headers: Vec<String>) {
         let key = key(object);
         if self.entries.get(&key) != Some(&headers) {
+            self.pending.push(Record::Headers {
+                object: key.clone(),
+                headers: headers.clone(),
+            });
             self.entries.insert(key, headers);
             self.changed = true;
         }
-    }
-
-    /// Forget objects that no longer exist, then write the record if anything changed,
-    /// so a no-op build writes nothing.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the file can't be written.
-    pub fn save_if_changed(&mut self) -> io::Result<()> {
-        let before = self.entries.len();
-        self.entries.retain(|object, _| Path::new(object).exists());
-        if self.changed || self.entries.len() != before {
-            store::save(&self.path, FORMAT_VERSION, &self.entries)?;
-            self.changed = false;
-        }
-        Ok(())
     }
 }
 
@@ -110,46 +109,38 @@ pub fn headers_from_depfile(deps: Vec<String>, root: &Path, source: &Path) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::state::State;
     use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn records_saves_and_forgets_missing_objects() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".yam/headers.json");
+        let state_dir = dir.path().join(".yam");
         let kept = dir.path().join("a.o");
         let gone = dir.path().join("b.o");
         fs::write(&kept, "").unwrap();
 
-        let (mut record, error) = HeaderRecord::load(&path);
-        assert!(error.is_none());
-        assert_eq!(record.get(&kept), &[] as &[String]);
-        record.record(&kept, vec!["src/a.hpp".into()]);
-        record.record(&gone, vec!["src/b.hpp".into()]);
-        record.save_if_changed().unwrap();
+        let (mut state, errors) = State::load(&state_dir);
+        assert!(errors.is_empty());
+        assert_eq!(state.headers.get(&kept), &[] as &[String]);
+        state.headers.record(&kept, vec!["src/a.hpp".into()]);
+        state.headers.record(&gone, vec!["src/b.hpp".into()]);
+        state.save().unwrap();
 
-        let (mut record, _) = HeaderRecord::load(&path);
-        assert_eq!(record.get(&kept), ["src/a.hpp"]);
+        let (mut state, _) = State::load(&state_dir);
+        assert_eq!(state.headers.get(&kept), ["src/a.hpp"]);
         assert_eq!(
-            record.get(&gone),
+            state.headers.get(&gone),
             &[] as &[String],
             "missing objects are dropped"
         );
 
         // Recording the same headers again changes nothing, so nothing is written.
-        record.record(&kept, vec!["src/a.hpp".into()]);
-        fs::remove_file(&path).unwrap();
-        record.save_if_changed().unwrap();
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn a_corrupt_record_is_discarded() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("headers.json");
-        fs::write(&path, "{").unwrap();
-        let (record, error) = HeaderRecord::load(&path);
-        assert!(matches!(error, Some(StoreError::Invalid { .. })));
-        assert_eq!(record.get(Path::new("a.o")), &[] as &[String]);
+        state.headers.record(&kept, vec!["src/a.hpp".into()]);
+        fs::remove_file(state_dir.join("state")).unwrap();
+        state.save().unwrap();
+        assert!(!state_dir.join("state").exists());
     }
 
     #[test]

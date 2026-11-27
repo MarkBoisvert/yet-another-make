@@ -44,8 +44,8 @@ Yam.toml ─► target model ─► source discovery ─► toolchain ─► std
 1. **Load the manifest** and resolve the target model (#10): Cargo-style conventions,
    or `[lib]`/`[[bin]]` overrides with `sources`/`exclude` globs.
 2. **Discover sources** by expanding globs over one walk of the project (#20).
-   Directory listings and their mtimes are kept in the state file, so unchanged
-   directories aren't walked again (#26).
+   Directory listings and their mtimes are kept in the state file, so an unchanged
+   directory isn't read again (#26).
 3. **Locate the toolchain**: `clang++`, `clang-scan-deps` and `std.cppm` (#16). Each
    tool comes from an override (`YAM_CXX`, `YAM_CLANG_SCAN_DEPS`), then the bundled
    toolchain, then `PATH`; `clang-scan-deps` is first looked for next to `clang++`.
@@ -104,8 +104,7 @@ process.
   - `-MMD`, not `-MD`: only project headers are recorded. libc++ alone is over a
     thousand headers per file, and toolchain headers change only with the toolchain,
     whose path and version are already part of every key.
-  - Until the state file (#26), the record is `target/<Profile>/.yam/headers.json`,
-    keyed by object file. A no-op build doesn't rewrite it.
+  - The record is part of the state file (#26), keyed by object file.
 - **A native fast-path scanner is deferred** (#29). C++20 restricts module
   declarations at the top of a file enough that, when no `#if` or macros surround
   them, yam could read them directly. That is built only if #28 shows scanning still
@@ -208,33 +207,46 @@ archive and any library files named in `links`.
   The same holds for objects and archives. In Debug builds this rarely applies,
   because `-g` writes DWARF 5, which embeds each source file's checksum; any edit
   changes the object.
-- **The record** is `target/<Profile>/.yam/outputs.json` until the state file (#26),
-  with paths and hashes interned. A no-op build doesn't rewrite it, and a failed
-  build keeps the outputs it finished.
+- **The record** is part of the state file (#26), with paths and hashes interned. A
+  no-op build doesn't rewrite it, and a failed or killed build keeps the outputs it
+  finished.
 - `std.pcm`/`std.o` keep their own stamp (see [std.pcm](#stdpcm--decided)); what they
   feed is tracked by contents like any other input.
 
-## Build state file — Proposed (#26)
+## Build state file — Decided (#26)
 
-The state file is one file per profile, `target/<Profile>/.yam/state`, read with a
-single read at startup and written at the end of the build.
+One file per profile, `target/<Profile>/.yam/state`, read with a single `fs::read`
+before the source walk (`src/engine/state.rs`). It's a hand-rolled binary format: at
+10k-unit scale (50k paths, 700k output inputs) it loaded in 11 ms, against 45 ms for
+`postcard` and 87 ms for JSON, and needs no `unsafe` (which rules out memory-mapping).
 
-- **Header:** magic number, format version, yam version and a checksum. A version
-  mismatch or a corrupt file is discarded with a `note:`, and the build runs as a
-  clean build. Never a crash.
-- **Path table:** interned paths, so every other table refers to a path by an integer.
-- **Tables:**
-  - files: mtime, size and blake3 per path
-  - directory listings: mtime plus the entries, for glob expansion (#20, #26)
-  - scan results: module provides/requires keyed on content and flags hash (#22)
-  - header dependencies from depfiles (#23)
-  - outputs: the command hash and the input set each output was built from (#24)
-- **Durability:** written to a temporary file and atomically renamed into place.
-  Results are recorded as jobs finish, so an interrupted or failing build keeps the
-  progress it made.
-- **Encoding:** a compact binary layout designed for zero-copy or near-zero-copy
-  loading. The exact crate (hand-rolled, `rkyv`, `bincode`, …) is chosen in #26 based
-  on startup measurements.
+- **Layout:** fixed-width little-endian fields.
+  - header: magic `YAMSTATE`, format version, yam version
+  - one table of every string; everything else refers to a string by index, so each
+    path is stored once
+  - sections, in order:
+    - outputs: their paths and contents hashes (interned), what yam last saw of each
+      file (mtime, size, hash), and each output's command hash and inputs (#24)
+    - scan results, keyed on contents, headers and flags (#22)
+    - header dependencies from depfiles, by object (#23)
+    - directory listings: mtime plus entries, for the source walk (#20)
+  - a blake3 checksum of everything before it
+- **Errors:** a missing file is an empty state. A corrupt, truncated or other-version
+  file is discarded with a `note:`, and the build starts over. Never a crash: every
+  read is bounds-checked, and counts are checked against the bytes left.
+- **Snapshot and journal, like ninja's logs:**
+  - The snapshot is rewritten only when something changed, to a temporary file that
+    is renamed into place. A no-op build writes nothing.
+  - While a build runs, each finished job's results are appended to
+    `.yam/state.journal` as framed records (length, payload, 8-byte blake3 check),
+    with paths inline. The journal names the checksum of the snapshot it extends.
+  - Loading replays the journal over that snapshot and stops at a half-written last
+    record. A journal for another snapshot is ignored. So a build killed partway
+    keeps the progress it made; the next save folds the journal in and removes it.
+- **Directory listings:** a directory whose mtime hasn't moved isn't read again; its
+  mtime changes whenever an entry is added, removed or renamed. A directory changed
+  within the last two seconds isn't trusted next time, so an entry added within the
+  same mtime tick can't be missed.
 
 ## Scheduler — Decided (#25)
 
@@ -272,10 +284,8 @@ single read at startup and written at the end of the build.
 target/
 └── <Profile>/                # Debug | Release
     ├── .yam/
-    │   ├── scan-cache.json   # scan results (#22), until the state file takes them over
-    │   ├── headers.json      # each object's project headers (#23), likewise
-    │   ├── outputs.json      # what each output was built from (#24), likewise
-    │   └── state             # build state file (#26)
+    │   ├── state             # build state file (#26): outputs, scans, headers, listings
+    │   └── state.journal     # results since the last snapshot, while a build runs
     ├── std/<std>/            # std.pcm + std.o per standard in use, e.g. std/c++26/
     ├── modules/<project>/    # the library's compiled module interfaces (.pcm)
     │   └── bin/<bin>/        # a bin's own module interfaces, if it has any
@@ -315,8 +325,6 @@ the platform allocator on each OS.
 
 ## Open questions
 
-- **State file encoding:** the crate or a hand-rolled format, decided in #26 from
-  startup measurements.
 - **Parallel `stat`:** whether parallel `stat` calls on the no-op path beat a
   sequential walk on typical filesystems. Measured in #27.
 - **`std.compat.pcm`:** built only when some file imports `std.compat`, or always.

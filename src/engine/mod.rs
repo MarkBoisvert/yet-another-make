@@ -1,6 +1,6 @@
 //! The build engine: scanning source files for their module dependencies (with a
-//! persistent cache), the order to compile a target's files in, the build graph, and
-//! the record of what each output was built from.
+//! persistent cache), the order to compile a target's files in, the build graph, the
+//! record of what each output was built from, and the state file that keeps it all.
 
 pub mod depfile;
 pub mod entry;
@@ -10,7 +10,7 @@ pub mod outputs;
 pub mod plan;
 pub mod scan;
 pub mod scan_cache;
-pub mod store;
+pub mod state;
 
 pub use entry::defines_main;
 pub use graph::{Action, GraphTarget, Node, graph};
@@ -22,4 +22,4 @@ pub use plan::{
 };
 pub use scan::{Deps, Provided, ScanError, ScanJob, scan};
 pub use scan_cache::{FlagsHash, HeaderHash, Key, ScanCache};
-pub use store::StoreError;
+pub use state::{State, StoreError};

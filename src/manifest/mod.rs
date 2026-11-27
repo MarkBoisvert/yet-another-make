@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 pub use cpp_std::{CppStd, ParseCppStdError};
-pub use sources::{GlobError, GlobList, SourceTree, slash_path};
+pub use sources::{DirCache, GlobError, GlobList, Listing, SourceTree, slash_path};
 pub use targets::{Target, TargetKind, resolve_targets};
 pub use validate::{
     Diagnostic, Severity, check_name, has_errors, is_link_path, report, validate, validate_tree,

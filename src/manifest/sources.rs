@@ -3,9 +3,10 @@
 //! Globs use `/` separators, `*` doesn't cross directories, `**` does, and `\` escapes a
 //! metacharacter on every platform. Everything stays inside the project root.
 
-use std::collections::HashSet;
-use std::io;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Component, Path};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
@@ -21,6 +22,120 @@ pub struct SourceTree {
     files: Vec<String>,
 }
 
+/// A directory as the last walk saw it: its mtime (nanoseconds since the epoch) and
+/// its entries, each a name and whether it's a directory. Hidden entries and the
+/// root's `target/` are already left out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Listing {
+    pub mtime: u64,
+    pub entries: Vec<(String, bool)>,
+}
+
+/// Directory listings from the last walk, so an unchanged directory isn't read again:
+/// a directory's mtime changes whenever an entry is added, removed or renamed. Kept in
+/// the build state file.
+#[derive(Debug, Default)]
+pub struct DirCache {
+    old: HashMap<String, Listing>,
+    used: HashMap<String, Listing>,
+    changed: bool,
+}
+
+/// A listing this young isn't trusted next time: an entry added within the same
+/// mtime tick wouldn't change the directory's mtime.
+const RACY: Duration = Duration::from_secs(2);
+
+impl DirCache {
+    /// A cache from the listings the state file holds, by `/`-separated directory
+    /// path relative to the root (`""` for the root itself).
+    #[must_use]
+    pub fn from_listings(listings: HashMap<String, Listing>) -> Self {
+        Self {
+            old: listings,
+            ..Self::default()
+        }
+    }
+
+    /// The listings this walk used: what the next build keeps.
+    #[must_use]
+    pub fn listings(&self) -> &HashMap<String, Listing> {
+        &self.used
+    }
+
+    /// Whether the listings to keep differ from those loaded.
+    #[must_use]
+    pub fn needs_save(&self) -> bool {
+        self.changed || !self.old.is_empty()
+    }
+
+    pub fn saved(&mut self) {
+        self.old.clear();
+        self.changed = false;
+    }
+
+    pub fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
+    /// The entries of `dir` (at `relative`), reused when its mtime hasn't moved.
+    fn list(
+        &mut self,
+        dir: &Path,
+        relative: &str,
+        depth: usize,
+    ) -> Result<Vec<(String, bool)>, ManifestError> {
+        let list_err = |source| ManifestError::ListDir {
+            path: dir.to_path_buf(),
+            source,
+        };
+        let modified = fs::metadata(dir)
+            .and_then(|meta| meta.modified())
+            .map_err(list_err)?;
+        let mtime = nanos(modified);
+        let old = self.old.remove(relative);
+        if let Some(listing) = &old
+            && listing.mtime == mtime
+            && mtime != 0
+        {
+            let entries = listing.entries.clone();
+            self.used.insert(relative.to_string(), listing.clone());
+            return Ok(entries);
+        }
+
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(dir).map_err(list_err)? {
+            let entry = entry.map_err(list_err)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || (depth == 0 && name == TARGET_DIR) {
+                continue;
+            }
+            // Symlinks aren't followed, as before: only real files and directories.
+            let kind = entry.file_type().map_err(list_err)?;
+            if kind.is_dir() || kind.is_file() {
+                entries.push((name, kind.is_dir()));
+            }
+        }
+        entries.sort();
+        let young = SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age < RACY);
+        let listing = Listing {
+            mtime: if young { 0 } else { mtime },
+            entries: entries.clone(),
+        };
+        // Reading a directory again isn't a change unless what it holds is.
+        self.changed |= old.as_ref() != Some(&listing);
+        self.used.insert(relative.to_string(), listing);
+        Ok(entries)
+    }
+}
+
+fn nanos(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |since| {
+        u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+    })
+}
+
 impl SourceTree {
     /// Walk the project root once.
     ///
@@ -28,25 +143,35 @@ impl SourceTree {
     ///
     /// Fails if a directory under `root` can't be read.
     pub fn scan(root: &Path) -> Result<Self, ManifestError> {
-        let walker = walkdir::WalkDir::new(root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                entry.depth() == 0
-                    || !(name.starts_with('.') || (entry.depth() == 1 && name == TARGET_DIR))
-            });
+        Self::scan_cached(root, &mut DirCache::default())
+    }
 
+    /// Walk the project root, reusing the listings in `cache` for directories that
+    /// haven't changed, and recording the rest.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a directory under `root` can't be read.
+    pub fn scan_cached(root: &Path, cache: &mut DirCache) -> Result<Self, ManifestError> {
         let mut files = Vec::new();
-        for entry in walker {
-            let entry = entry.map_err(|err| ManifestError::ListDir {
-                path: err.path().unwrap_or(root).to_path_buf(),
-                source: io::Error::from(err),
-            })?;
-            if entry.file_type().is_file()
-                && let Ok(relative) = entry.path().strip_prefix(root)
-            {
-                files.push(slash_path(relative));
+        let mut pending = vec![(String::new(), 0usize)];
+        while let Some((relative, depth)) = pending.pop() {
+            let dir = if relative.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(&relative)
+            };
+            for (name, is_dir) in cache.list(&dir, &relative, depth)? {
+                let child = if relative.is_empty() {
+                    name
+                } else {
+                    format!("{relative}/{name}")
+                };
+                if is_dir {
+                    pending.push((child, depth + 1));
+                } else {
+                    files.push(child);
+                }
             }
         }
         files.sort();
@@ -256,5 +381,74 @@ mod tests {
             tree.select(&globs(&["src/odd\\[1\\].cpp"]), &globs(&[])),
             ["src/odd[1].cpp"]
         );
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// Age every directory under `root` by an hour, as if made long ago.
+    #[cfg(unix)]
+    fn age(root: &Path) {
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if entry.file_type().is_dir() {
+                fs::File::open(entry.path())
+                    .and_then(|file| file.set_modified(old))
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn walks_match_with_and_without_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in ["src/main.cpp", "src/a/b.cppm", "target/x.o", ".git/config"] {
+            let path = dir.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let mut cache = DirCache::default();
+        let cached = SourceTree::scan_cached(dir.path(), &mut cache).unwrap();
+        assert_eq!(cached.files(), ["src/a/b.cppm", "src/main.cpp"]);
+        assert_eq!(cached, SourceTree::scan(dir.path()).unwrap());
+        assert!(cache.needs_save());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_directories_are_reused_and_changes_are_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a.cpp"), "").unwrap();
+        age(dir.path());
+
+        let mut cache = DirCache::default();
+        SourceTree::scan_cached(dir.path(), &mut cache).unwrap();
+        cache.saved();
+        let mut cache = DirCache::from_listings(cache.listings().clone());
+        let tree = SourceTree::scan_cached(dir.path(), &mut cache).unwrap();
+        assert_eq!(tree.files(), ["src/a.cpp"]);
+        assert!(!cache.needs_save(), "nothing changed, so nothing to write");
+
+        // A new file changes its directory's mtime, so it's listed again.
+        fs::write(dir.path().join("src/b.cpp"), "").unwrap();
+        let mut cache = DirCache::from_listings(cache.listings().clone());
+        let tree = SourceTree::scan_cached(dir.path(), &mut cache).unwrap();
+        assert_eq!(tree.files(), ["src/a.cpp", "src/b.cpp"]);
+        assert!(cache.needs_save());
+    }
+
+    #[test]
+    fn a_directory_changed_just_now_isnt_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.cpp"), "").unwrap();
+        let mut cache = DirCache::default();
+        SourceTree::scan_cached(dir.path(), &mut cache).unwrap();
+        assert_eq!(cache.listings()[""].mtime, 0);
     }
 }
