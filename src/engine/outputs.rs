@@ -36,14 +36,47 @@ impl CommandHash {
     /// arguments, program first.
     #[must_use]
     pub fn new<'a>(tools: &str, arguments: impl IntoIterator<Item = &'a OsStr>) -> Self {
+        let mut hasher = CommandHasher::new(tools);
+        for argument in arguments {
+            hasher.arg(argument);
+        }
+        hasher.finish()
+    }
+}
+
+/// A [`CommandHash`] built up an argument at a time. Cloning one part way through
+/// lets the arguments many commands share be hashed once: every compile in a target
+/// starts the same way, and only its last few arguments differ.
+#[derive(Clone, Debug)]
+pub struct CommandHasher(blake3::Hasher);
+
+impl CommandHasher {
+    #[must_use]
+    pub fn new(tools: &str) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"yam-command\0");
         hasher.update(tools.as_bytes());
-        for argument in arguments {
-            hasher.update(b"\0");
-            hasher.update(argument.as_encoded_bytes());
-        }
-        Self(*hasher.finalize().as_bytes())
+        Self(hasher)
+    }
+
+    /// Add one argument.
+    pub fn arg(&mut self, argument: impl AsRef<OsStr>) -> &mut Self {
+        self.0.update(b"\0");
+        self.0.update(argument.as_ref().as_encoded_bytes());
+        self
+    }
+
+    /// Add arguments already encoded the way [`Self::arg`] does, each one after a
+    /// NUL. A constant run of arguments is one literal this way: one hasher call,
+    /// not two per argument.
+    pub fn encoded(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.update(bytes);
+        self
+    }
+
+    #[must_use]
+    pub fn finish(&self) -> CommandHash {
+        CommandHash(*self.0.finalize().as_bytes())
     }
 }
 
@@ -83,11 +116,17 @@ pub(super) struct Tables<'a> {
     pub entries: &'a HashMap<String, Entry>,
 }
 
-/// What this build knows of a file's contents.
+/// What this build knows of a file. Each file is `stat`ed at most once a build,
+/// whether its existence or its contents is asked about first.
 #[derive(Clone, Copy, Debug, Default)]
 enum Current {
     #[default]
     Unchecked,
+    /// It doesn't exist, or can't be `stat`ed.
+    Missing,
+    /// Its stat; its contents aren't needed yet.
+    Stat(Stat),
+    /// It exists but can't be read.
     Unreadable,
     /// Its contents hash id.
     Hash(u32),
@@ -205,27 +244,89 @@ impl Outputs {
             .into_iter()
             .map(|input| self.intern(input.as_ref()))
             .collect();
+        let output = self.intern(output);
         self.is_fresh_ids(output, command, &ids)
     }
 
-    /// [`Self::is_fresh`] for inputs already interned with [`Self::intern`].
-    pub fn is_fresh_ids(&mut self, output: &Path, command: CommandHash, inputs: &[u32]) -> bool {
+    /// [`Self::is_fresh`] for an output and inputs already interned with
+    /// [`Self::intern`].
+    pub fn is_fresh_ids(&mut self, output: u32, command: CommandHash, inputs: &[u32]) -> bool {
         let current: Vec<Option<u32>> = inputs.iter().map(|&id| self.current_hash(id)).collect();
-        let recorded = match output.to_str() {
-            Some(text) => self.entries.get(text),
-            None => self.entries.get(&key(output)),
-        };
-        let Some((recorded_command, recorded)) = recorded else {
+        let Some((recorded_command, recorded)) = self.entries.get(&self.paths[output as usize])
+        else {
             return false;
         };
-        *recorded_command == command.0
+        let matches = *recorded_command == command.0
             && recorded.len() == inputs.len()
             && recorded.iter().zip(inputs.iter().zip(&current)).all(
                 |(&(path, hash), (&now_path, &now_hash))| {
                     path == now_path && Some(hash) == now_hash
                 },
-            )
-            && output.exists()
+            );
+        matches && self.exists(output)
+    }
+
+    /// Whether the file exists, as of this build. It shares its `stat` with the
+    /// contents check, so a file asked about both ways (an object is both a
+    /// compile's output and the archive's input) is `stat`ed once.
+    pub fn exists(&mut self, id: u32) -> bool {
+        !matches!(self.stat(id), Current::Missing)
+    }
+
+    /// `stat` every file the recorded outputs name, inputs and outputs alike, on up
+    /// to `threads` threads, so the checks that follow find them already done. On a
+    /// no-op build that's nearly every `stat` it makes, and they're most of its
+    /// time; the kernel answers them in parallel.
+    ///
+    /// Only worth calling before anything has been checked. A file a step writes
+    /// later is forgotten by [`Self::invalidate`] as usual, so stating early changes
+    /// nothing a sequential check wouldn't have seen.
+    pub fn prefetch(&mut self, threads: usize) {
+        /// Below this many files per thread, starting threads costs more than it
+        /// saves.
+        const MIN_PER_THREAD: usize = 512;
+        /// More threads than this measured no faster.
+        const MAX_THREADS: usize = 8;
+        let mut wanted = vec![false; self.paths.len()];
+        for (output, (_, inputs)) in &self.entries {
+            if let Some(&id) = self.path_ids.get(output) {
+                wanted[id as usize] = true;
+            }
+            for &(id, _) in inputs {
+                wanted[id as usize] = true;
+            }
+        }
+        let ids: Vec<u32> = (0..self.paths.len())
+            .filter(|&i| {
+                wanted[i] && matches!(self.current.get(i), None | Some(Current::Unchecked))
+            })
+            .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
+            .collect();
+        let threads = threads.min(MAX_THREADS).min(ids.len() / MIN_PER_THREAD);
+        if threads < 2 {
+            return;
+        }
+        let paths = &self.paths;
+        let stat = |id: &u32| {
+            Stat::of(Path::new(&paths[*id as usize])).map_or(Current::Missing, Current::Stat)
+        };
+        let found: Vec<Vec<Current>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = ids
+                .chunks(ids.len().div_ceil(threads))
+                .map(|chunk| scope.spawn(move || chunk.iter().map(stat).collect()))
+                .collect();
+            // A worker that panicked leaves its files to be checked as they come up.
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap_or_default())
+                .collect()
+        });
+        self.current.resize(self.paths.len(), Current::Unchecked);
+        for (chunk, found) in ids.chunks(ids.len().div_ceil(threads)).zip(found) {
+            for (&id, current) in chunk.iter().zip(found) {
+                self.current[id as usize] = current;
+            }
+        }
     }
 
     /// Record that `output` was built by `command` from `inputs`. Inputs already
@@ -329,28 +430,37 @@ impl Outputs {
     /// The file's contents hash id now: reused from the last time yam saw it when
     /// its stat is unchanged, otherwise read and hashed.
     fn current_hash(&mut self, id: u32) -> Option<u32> {
-        match self.current.get(id as usize) {
-            Some(Current::Hash(hash)) => return Some(*hash),
-            Some(Current::Unreadable) => return None,
-            Some(Current::Unchecked) | None => {}
-        }
-        let path = PathBuf::from(&self.paths[id as usize]);
-        let hash = Stat::of(&path).and_then(|stat| match self.seen.get(&id) {
+        let stat = match self.stat(id) {
+            Current::Hash(hash) => return Some(hash),
+            Current::Missing | Current::Unreadable | Current::Unchecked => return None,
+            Current::Stat(stat) => stat,
+        };
+        let hash = match self.seen.get(&id) {
             Some(&(seen, hash)) if seen == stat => Some(hash),
-            _ => {
-                let bytes = fs::read(&path).ok()?;
+            _ => fs::read(&self.paths[id as usize]).ok().map(|bytes| {
                 let hash = self.hash_id(blake3::hash(&bytes).as_bytes());
                 self.seen.insert(id, (stat, hash));
                 self.changed = true;
-                Some(hash)
-            }
-        });
+                hash
+            }),
+        };
+        let current = hash.map_or(Current::Unreadable, Current::Hash);
+        self.current[id as usize] = current;
+        hash
+    }
+
+    /// What this build knows of the file, `stat`ing it the first time it's asked
+    /// about. Never [`Current::Unchecked`].
+    fn stat(&mut self, id: u32) -> Current {
         let slot = id as usize;
         if self.current.len() <= slot {
             self.current.resize(slot + 1, Current::Unchecked);
         }
-        self.current[slot] = hash.map_or(Current::Unreadable, Current::Hash);
-        hash
+        if let Current::Unchecked = self.current[slot] {
+            self.current[slot] =
+                Stat::of(Path::new(&self.paths[slot])).map_or(Current::Missing, Current::Stat);
+        }
+        self.current[slot]
     }
 }
 
@@ -512,5 +622,78 @@ mod tests {
         fs::write(&p.header, "#pragma once\n// rewritten by a step").unwrap();
         state.outputs.invalidate(&p.header);
         assert!(!state.outputs.is_fresh(&p.object, command("cc"), &inputs));
+    }
+
+    #[test]
+    fn a_deleted_output_is_stale_and_its_stat_is_shared() {
+        let p = project();
+        let mut state = built(&p);
+        let inputs = [p.source.clone(), p.header.clone()];
+        let object = state.outputs.intern(&p.object);
+        assert!(state.outputs.exists(object));
+        fs::remove_file(&p.object).unwrap();
+        // This build already saw it: one `stat` a file, whichever check asks first.
+        assert!(state.outputs.is_fresh(&p.object, command("cc"), &inputs));
+        let mut state = p.load();
+        assert!(!state.outputs.is_fresh(&p.object, command("cc"), &inputs));
+    }
+
+    #[test]
+    fn a_command_hash_built_in_parts_is_the_same() {
+        let args = ["clang++", "-std=c++26", "-c", "a.cpp", "-o", "a.o"].map(OsStr::new);
+        let whole = CommandHash::new("clang 23", args);
+        let mut shared = CommandHasher::new("clang 23");
+        shared.arg("clang++").arg("-std=c++26");
+        let parts = shared
+            .clone()
+            .encoded(b"\0-c")
+            .arg("a.cpp")
+            .encoded(b"\0-o\0a.o")
+            .finish();
+        assert_eq!(whole, parts);
+        assert_ne!(whole, shared.finish());
+    }
+
+    #[test]
+    fn prefetched_stats_match_checking_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".yam");
+        // Enough files for the prefetch to use threads.
+        let inputs: Vec<PathBuf> = (0..1500)
+            .map(|i| {
+                let path = dir.path().join(format!("{i}.h"));
+                fs::write(&path, format!("// {i}")).unwrap();
+                path
+            })
+            .collect();
+        let output = dir.path().join("out");
+        fs::write(&output, "out").unwrap();
+        let (mut state, _) = State::load(&state_dir);
+        state.outputs.record(&output, command("cc"), &inputs);
+        state.save().unwrap();
+
+        // Changed before the build starts: the prefetch sees it.
+        fs::write(&inputs[700], "// changed").unwrap();
+        set_mtime(&inputs[700], 5);
+        let (mut state, _) = State::load(&state_dir);
+        state.outputs.prefetch(4);
+        assert!(
+            state
+                .outputs
+                .current
+                .iter()
+                .all(|c| !matches!(c, Current::Unchecked))
+        );
+        assert!(!state.outputs.is_fresh(&output, command("cc"), &inputs));
+        state.outputs.record(&output, command("cc"), &inputs);
+        state.save().unwrap();
+
+        let (mut state, _) = State::load(&state_dir);
+        state.outputs.prefetch(4);
+        assert!(state.outputs.is_fresh(&output, command("cc"), &inputs));
+        fs::remove_file(&inputs[3]).unwrap();
+        let (mut state, _) = State::load(&state_dir);
+        state.outputs.prefetch(4);
+        assert!(!state.outputs.is_fresh(&output, command("cc"), &inputs));
     }
 }
