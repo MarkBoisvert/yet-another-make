@@ -19,12 +19,11 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use rustc_hash::FxHashMap;
 
 use crate::cli::BuildArgs;
 use crate::engine::{
-    self, Action, CommandHash, Deps, FlagsHash, GraphTarget, Key, Plan, STD_MODULE, ScanJob,
-    SourceFile, State,
+    self, Action, CommandHash, Deps, FlagsHash, GraphTarget, HeaderDigest, HeaderRecord, Key, Plan,
+    STD_MODULE, ScanJob, SourceFile, State,
 };
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
@@ -476,8 +475,9 @@ fn print_output(output: &[(Vec<u8>, Vec<u8>)]) {
 /// build fails, and journaled as jobs finish, so a killed build keeps its progress.
 struct Caches {
     state: State,
-    /// Header contents hashes for this build, by the header's recorded path.
-    header_hashes: FxHashMap<String, Option<blake3::Hash>>,
+    /// What this build knows of each recorded header, by header id: resolved the
+    /// first time any file needs it.
+    header_info: Vec<Option<HeaderInfo>>,
     /// Whether writing the journal already failed, so that's reported once.
     journal_failed: bool,
 }
@@ -490,7 +490,7 @@ impl Caches {
         }
         Self {
             state,
-            header_hashes: FxHashMap::default(),
+            header_info: Vec::new(),
             journal_failed: false,
         }
     }
@@ -509,25 +509,23 @@ impl Caches {
 
     /// The scan key for a file, using the headers `object` was last compiled with.
     fn key(&mut self, root: &Path, file: &FileKey, object: &Path) -> Key {
-        let headers = self.state.headers.get(object);
-        let hashes = header_hashes(
-            &mut self.header_hashes,
-            &mut self.state.outputs,
-            root,
-            headers,
-        );
-        scan_key(file, headers, hashes)
-    }
-
-    /// The scan key for a file compiled with `headers`.
-    fn key_with(&mut self, root: &Path, file: &FileKey, headers: &[String]) -> Key {
-        let hashes = header_hashes(
-            &mut self.header_hashes,
-            &mut self.state.outputs,
-            root,
-            headers,
-        );
-        scan_key(file, headers, hashes)
+        let state = &mut self.state;
+        let digests: Vec<HeaderDigest> = state
+            .headers
+            .get(object)
+            .iter()
+            .map(|&id| {
+                resolve_header(
+                    &mut self.header_info,
+                    &state.headers,
+                    &mut state.outputs,
+                    root,
+                    id,
+                )
+                .digest
+            })
+            .collect();
+        Key::new(&file.flags, &file.contents, &digests)
     }
 
     fn save(&mut self) {
@@ -537,30 +535,37 @@ impl Caches {
     }
 }
 
-/// The contents hash of each of `headers`, each looked up once per build.
-fn header_hashes(
-    memo: &mut FxHashMap<String, Option<blake3::Hash>>,
-    outputs: &mut engine::Outputs,
-    root: &Path,
-    headers: &[String],
-) -> Vec<Option<blake3::Hash>> {
-    headers
-        .iter()
-        .map(|header| {
-            if let Some(&hash) = memo.get(header.as_str()) {
-                return hash;
-            }
-            let hash = outputs.contents(&root.join(header));
-            memo.insert(header.clone(), hash);
-            hash
-        })
-        .collect()
+/// One recorded header as this build sees it.
+#[derive(Clone, Copy)]
+struct HeaderInfo {
+    /// Its id in the output record.
+    path: u32,
+    /// Its path and contents, for scan keys.
+    digest: HeaderDigest,
 }
 
-fn scan_key(file: &FileKey, headers: &[String], hashes: Vec<Option<blake3::Hash>>) -> Key {
-    let pairs: Vec<engine::HeaderHash<'_>> =
-        headers.iter().map(String::as_str).zip(hashes).collect();
-    Key::new(&file.flags, &file.contents, &pairs)
+/// Header `id`'s info, worked out once per build: its path is joined, looked up and
+/// hashed here, rather than for every file that includes it.
+fn resolve_header(
+    memo: &mut Vec<Option<HeaderInfo>>,
+    headers: &HeaderRecord,
+    outputs: &mut engine::Outputs,
+    root: &Path,
+    id: u32,
+) -> HeaderInfo {
+    let slot = id as usize;
+    if let Some(Some(info)) = memo.get(slot) {
+        return *info;
+    }
+    let name = headers.name(id);
+    let path = outputs.intern(&root.join(name));
+    let digest = HeaderDigest::new(name, outputs.contents_of(path).as_ref());
+    let info = HeaderInfo { path, digest };
+    if memo.len() <= slot {
+        memo.resize(slot + 1, None);
+    }
+    memo[slot] = Some(info);
+    info
 }
 
 /// What a file's scan key is made of, apart from its headers.
@@ -1126,11 +1131,24 @@ impl Builder<'_> {
 
         let fresh = {
             let mut caches = self.caches.borrow_mut();
-            let state = &mut caches.state;
-            let inputs = std::iter::once(source.clone())
-                .chain(state.headers.get(&object).iter().map(|h| self.root.join(h)))
-                .chain(pcms.iter().cloned());
-            state.outputs.is_fresh(&object, command, inputs)
+            let Caches {
+                state, header_info, ..
+            } = &mut *caches;
+            let headers = state.headers.get(&object);
+            let mut inputs = Vec::with_capacity(1 + headers.len() + pcms.len());
+            inputs.push(state.outputs.intern(&source));
+            for &id in headers {
+                let info = resolve_header(
+                    header_info,
+                    &state.headers,
+                    &mut state.outputs,
+                    self.root,
+                    id,
+                );
+                inputs.push(info.path);
+            }
+            inputs.extend(pcms.iter().map(|pcm| state.outputs.intern(pcm)));
+            state.outputs.is_fresh_ids(&object, command, &inputs)
         };
         if fresh && pcm.as_ref().is_none_or(|pcm| pcm.exists()) {
             return Ok(None);
@@ -1179,12 +1197,12 @@ impl Builder<'_> {
         let deps = fs::read_to_string(depfile).map_or_default(|text| engine::depfile::parse(&text));
         let headers = engine::headers_from_depfile(deps, self.root, &source);
         let mut caches = self.caches.borrow_mut();
-        let key = caches.key_with(self.root, &prepared.keys[file], &headers);
+        caches.state.headers.record(object, headers.clone());
+        let key = caches.key(self.root, &prepared.keys[file], object);
         caches
             .state
             .scan
             .insert(key, prepared.files[file].deps.clone());
-        caches.state.headers.record(object, headers.clone());
         headers
     }
 

@@ -21,5 +21,5 @@ pub use plan::{
     is_interface_file, plan,
 };
 pub use scan::{Deps, Provided, ScanError, ScanJob, scan};
-pub use scan_cache::{FlagsHash, HeaderHash, Key, ScanCache};
+pub use scan_cache::{FlagsHash, HeaderDigest, Key, ScanCache};
 pub use state::{State, StoreError};

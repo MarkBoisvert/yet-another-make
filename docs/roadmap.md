@@ -374,6 +374,9 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       helps.
     - Confirm that mimalloc beats the platform allocator on glibc, macOS and Windows.
       It's enabled on all targets; drop it per target if the data says otherwise.
+    - Follow-up #65: intern header paths, so a no-op build stops joining, comparing
+      and copying them per include. This mainly fixes the static musl build, whose
+      generic `memcpy`/`memcmp` made it much slower than glibc.
 28. **Perf gate: beat ninja** (bench, perf)
     - For every #19 scenario, both styles (modules and legacy) and every size (100,
       1k, 10k):

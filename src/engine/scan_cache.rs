@@ -18,8 +18,24 @@ use std::ffi::OsStr;
 use super::scan::Deps;
 use super::state::Record;
 
-/// A header's path and contents hash, or `None` if it can't be read.
-pub type HeaderHash<'a> = (&'a str, Option<blake3::Hash>);
+/// A digest of one header: its path and its contents hash, or that it can't be
+/// read. A build computes it once per header, however many files include it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderDigest([u8; 32]);
+
+impl HeaderDigest {
+    #[must_use]
+    pub fn new(path: &str, contents: Option<&blake3::Hash>) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"yam-header\0");
+        hasher.update(path.as_bytes());
+        match contents {
+            Some(hash) => hasher.update(b"=").update(hash.as_bytes()),
+            None => hasher.update(b"!"),
+        };
+        Self(*hasher.finalize().as_bytes())
+    }
+}
 
 /// A cache key: a hash of the flags, the file's contents and its headers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -27,24 +43,17 @@ pub struct Key(pub(super) [u8; 32]);
 
 impl Key {
     /// The key for a file whose contents hash to `contents`, scanned with flags
-    /// hashed as `flags`, and last compiled with `headers`.
+    /// hashed as `flags`, and last compiled with the headers digested in `headers`,
+    /// in order.
     #[must_use]
-    pub fn new(flags: &FlagsHash, contents: &blake3::Hash, headers: &[HeaderHash<'_>]) -> Self {
+    pub fn new(flags: &FlagsHash, contents: &blake3::Hash, headers: &[HeaderDigest]) -> Self {
         // Gathered into one buffer and hashed once: a file can have hundreds of
-        // headers, and many tiny `update` calls cost more than the hashing.
-        let mut bytes = Vec::with_capacity(64 + headers.len() * 64);
+        // headers, and many small `update` calls cost more than the hashing.
+        let mut bytes = Vec::with_capacity(64 + headers.len() * 32);
         bytes.extend_from_slice(flags.0.as_bytes());
         bytes.extend_from_slice(contents.as_bytes());
-        for (path, hash) in headers {
-            bytes.push(0);
-            bytes.extend_from_slice(path.as_bytes());
-            match hash {
-                Some(hash) => {
-                    bytes.push(b'=');
-                    bytes.extend_from_slice(hash.as_bytes());
-                }
-                None => bytes.push(b'!'),
-            }
+        for header in headers {
+            bytes.extend_from_slice(&header.0);
         }
         Self(*blake3::hash(&bytes).as_bytes())
     }
@@ -184,7 +193,13 @@ mod tests {
         );
 
         let (v1, v2) = (blake3::hash(b"#define X 0"), blake3::hash(b"#define X 1"));
-        let with = |headers: &[HeaderHash<'_>]| Key::new(&base, &contents, headers);
+        let with = |headers: &[(&str, Option<blake3::Hash>)]| {
+            let digests: Vec<HeaderDigest> = headers
+                .iter()
+                .map(|(path, hash)| HeaderDigest::new(path, hash.as_ref()))
+                .collect();
+            Key::new(&base, &contents, &digests)
+        };
         assert_ne!(key, with(&[("src/x.h", Some(v1))]));
         assert_ne!(
             with(&[("src/x.h", Some(v1))]),
@@ -195,6 +210,12 @@ mod tests {
             with(&[("src/y.h", Some(v1))])
         );
         assert_ne!(with(&[("src/x.h", Some(v1))]), with(&[("src/x.h", None)]));
+        // Order matters: the same headers included the other way round can scan
+        // differently.
+        assert_ne!(
+            with(&[("src/x.h", Some(v1)), ("src/y.h", Some(v2))]),
+            with(&[("src/y.h", Some(v2)), ("src/x.h", Some(v1))])
+        );
     }
 
     fn load(dir: &std::path::Path) -> State {

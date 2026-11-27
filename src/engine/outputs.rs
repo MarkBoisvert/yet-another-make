@@ -180,7 +180,7 @@ impl Outputs {
     ) {
         let mut recorded = Vec::with_capacity(inputs.len());
         for (path, hash, stat) in inputs {
-            let path = self.path_id(Path::new(path));
+            let path = self.intern(Path::new(path));
             let hash = self.hash_id(hash);
             if let Some(stat) = stat {
                 self.seen.insert(path, (*stat, hash));
@@ -201,13 +201,16 @@ impl Outputs {
         command: CommandHash,
         inputs: impl IntoIterator<Item = P>,
     ) -> bool {
-        let current: Vec<(u32, Option<u32>)> = inputs
+        let ids: Vec<u32> = inputs
             .into_iter()
-            .map(|input| {
-                let id = self.path_id(input.as_ref());
-                (id, self.current_hash(id))
-            })
+            .map(|input| self.intern(input.as_ref()))
             .collect();
+        self.is_fresh_ids(output, command, &ids)
+    }
+
+    /// [`Self::is_fresh`] for inputs already interned with [`Self::intern`].
+    pub fn is_fresh_ids(&mut self, output: &Path, command: CommandHash, inputs: &[u32]) -> bool {
+        let current: Vec<Option<u32>> = inputs.iter().map(|&id| self.current_hash(id)).collect();
         let recorded = match output.to_str() {
             Some(text) => self.entries.get(text),
             None => self.entries.get(&key(output)),
@@ -216,13 +219,12 @@ impl Outputs {
             return false;
         };
         *recorded_command == command.0
-            && recorded.len() == current.len()
-            && recorded
-                .iter()
-                .zip(&current)
-                .all(|(&(path, hash), &(now_path, now_hash))| {
+            && recorded.len() == inputs.len()
+            && recorded.iter().zip(inputs.iter().zip(&current)).all(
+                |(&(path, hash), (&now_path, &now_hash))| {
                     path == now_path && Some(hash) == now_hash
-                })
+                },
+            )
             && output.exists()
     }
 
@@ -233,7 +235,7 @@ impl Outputs {
         let mut recorded = Vec::with_capacity(inputs.len());
         let mut complete = true;
         for input in inputs {
-            let id = self.path_id(input);
+            let id = self.intern(input);
             match self.current_hash(id) {
                 Some(hash) => recorded.push((id, hash)),
                 None => complete = false,
@@ -285,12 +287,19 @@ impl Outputs {
     /// staleness, this reuses the recorded hash while the file's stat is unchanged,
     /// so an unchanged file isn't read.
     pub fn contents(&mut self, path: &Path) -> Option<blake3::Hash> {
-        let id = self.path_id(path);
+        let id = self.intern(path);
+        self.contents_of(id)
+    }
+
+    /// [`Self::contents`] for a path already interned with [`Self::intern`].
+    pub fn contents_of(&mut self, id: u32) -> Option<blake3::Hash> {
         let hash = self.current_hash(id)?;
         Some(blake3::Hash::from_bytes(self.hashes[hash as usize]))
     }
 
-    fn path_id(&mut self, path: &Path) -> u32 {
+    /// The record's id for `path`, adding it if it's new. Ids are stable for the
+    /// rest of the build, so a caller can look a path up once and keep its id.
+    pub fn intern(&mut self, path: &Path) -> u32 {
         // Looked up without allocating; nearly every path is already known.
         if let Some(&id) = path.to_str().and_then(|text| self.path_ids.get(text)) {
             return id;
