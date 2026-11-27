@@ -22,6 +22,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use rustc_hash::FxHashMap;
+
 use super::headers::HeaderRecord;
 use super::outputs::{Outputs, Stat};
 use super::scan::{Deps, Provided};
@@ -257,7 +259,7 @@ impl State {
     fn apply(&mut self, parts: Parts) {
         self.outputs = parts.outputs;
         self.scan = ScanCache::from_entries(parts.scans);
-        self.headers = HeaderRecord::from_entries(parts.headers);
+        self.headers = HeaderRecord::from_parts(parts.header_names, parts.headers);
         self.dirs = DirCache::from_listings(parts.dirs);
         self.toolchain = parts.toolchain;
     }
@@ -285,7 +287,8 @@ impl State {
 struct Parts {
     outputs: Outputs,
     scans: HashMap<Key, Deps>,
-    headers: HashMap<String, Vec<String>>,
+    header_names: Vec<String>,
+    headers: FxHashMap<String, Vec<u32>>,
     dirs: HashMap<String, Listing>,
     toolchain: Option<toolchain::Cached>,
 }
@@ -380,11 +383,11 @@ fn encode_snapshot(state: &State) -> Vec<u8> {
 
     let records = headers.entries();
     w.len(records.len());
-    for (object, list) in records {
+    for (object, ids) in records {
         w.str(object);
-        w.len(list.len());
-        for header in list {
-            w.str(header);
+        w.len(ids.len());
+        for &id in ids {
+            w.str(headers.name(id));
         }
     }
 
@@ -754,15 +757,26 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(Parts, [u8; 32])> {
         scans.insert(key, b.deps()?);
     }
 
+    // Header names are interned as they're read: each string-table id becomes a
+    // header id the first time an object lists it, so no header is copied twice.
     let count = b.reader.len()?;
-    let mut headers = HashMap::with_capacity(count);
+    let mut headers = FxHashMap::with_capacity_and_hasher(count, rustc_hash::FxBuildHasher);
+    let mut header_names: Vec<String> = Vec::new();
+    let mut header_of = vec![u32::MAX; b.strings.len()];
     for _ in 0..count {
         let object = b.str()?.to_string();
         let len = b.reader.len()?;
-        let list = (0..len)
-            .map(|_| b.str().map(str::to_string))
-            .collect::<Option<Vec<_>>>()?;
-        headers.insert(object, list);
+        let mut ids = Vec::with_capacity(len);
+        for _ in 0..len {
+            let string = b.reader.u32()? as usize;
+            let slot = header_of.get_mut(string)?;
+            if *slot == u32::MAX {
+                *slot = u32::try_from(header_names.len()).ok()?;
+                header_names.push(b.strings[string].to_string());
+            }
+            ids.push(*slot);
+        }
+        headers.insert(object, ids);
     }
 
     let count = b.reader.len()?;
@@ -788,6 +802,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(Parts, [u8; 32])> {
         Parts {
             outputs,
             scans,
+            header_names,
             headers,
             dirs,
             toolchain,
@@ -979,7 +994,7 @@ mod tests {
         );
         assert_eq!(state.scan.get(key(b"a")), Some(deps()));
         assert_eq!(
-            state.headers.get(&p.path("a.o")),
+            state.headers.names_of(&p.path("a.o")),
             ["src/a.hpp", "include/b.hpp"]
         );
         assert_eq!(state.toolchain(), Some(&cached_toolchain()));
@@ -1080,7 +1095,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(state.scan.get(key(b"new")), Some(Deps::default()));
         assert_eq!(state.scan.get(key(b"second")), Some(Deps::default()));
-        assert_eq!(state.headers.get(&p.path("a.o")), ["src/c.hpp"]);
+        assert_eq!(state.headers.names_of(&p.path("a.o")), ["src/c.hpp"]);
 
         // Saving folds the journal into the snapshot.
         state.save().unwrap();

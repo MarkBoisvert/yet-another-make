@@ -99,11 +99,33 @@ share the machine's conditions:
 
 - **Linux:** mimalloc wins with both C libraries, by 17–19% over glibc's allocator
   and 24–38% over musl's. So it stays on every target.
-- **The static musl build is slower even with mimalloc:** 44% slower than glibc on
-  modules and 78% on legacy. Nearly all of the gap is user-space CPU, not system
-  time, and its cause hasn't been found yet. It matters for #8's release binaries and
-  #28's gates: musl + mimalloc misses ninja's 35 ms legacy no-op.
+- **The static musl build was slower even with mimalloc:** 44% slower than glibc on
+  modules and 78% on legacy, nearly all of it user-space CPU. #65 found and mostly
+  fixed the cause; see below.
 - **macOS and Windows** haven't been measured yet.
+
+### musl and header paths (#65)
+
+`samply` profiles of 100 legacy 1k no-op builds showed where musl lost: its generic
+`memcpy` and `memcmp` took 37% of CPU time, against about 10% for glibc's SIMD
+versions. Most of those calls came from handling header paths as strings, about 130k
+per no-op build: joining each onto the project root, comparing it as a map key,
+copying it into scan keys, and copying it out of the state file. #65 interns header
+paths, so each header is resolved once per build and every file that includes it
+refers to it by id.
+
+All four binaries were timed in one `hyperfine` run per project (with mimalloc):
+
+| No-op, 1k units | glibc, #27 | glibc, #65 | musl, #27 | musl, #65 | `ninja` alone |
+|---|---|---|---|---|---|
+| legacy | 27.1 ms ± 0.9 | 16.5 ms ± 0.6 | 61.6 ms ± 5.9 | 22.2 ms ± 0.7 | 35 ms |
+| modules | 26.4 ms ± 0.8 | 25.5 ms ± 0.7 | 38.5 ms ± 1.8 | 37.4 ms ± 1.1 | 54 ms |
+
+- **musl now beats ninja in both styles at 1k units.**
+- **Modules didn't move:** those projects have no headers. Their remaining musl gap
+  comes from hashing each compile command in many small blake3 updates, rebuilding
+  target directory paths per node, formatting compiler arguments, and `stat` calls.
+
 
 ## Baseline: CMake + ninja
 

@@ -213,6 +213,10 @@ named in `links`.
   calls alone, and `touch`, `git checkout` and a save without changes rebuild nothing.
   The scan key's source and header hashes come from the same table, so the scan
   doesn't read unchanged files either.
+- **Header paths are interned** (#65). The header record stores each header once and
+  each object's headers as ids. A build resolves each header id once, to its id in
+  the output record and a digest of its path and contents, so checking an object's
+  headers compares integers and its scan key hashes one digest per header.
 - **Inputs are recorded as they were checked,** before the step ran. A file edited
   while it was being compiled is seen as changed by the next build.
 - **Restat, like ninja's:** an importer compares a `.pcm`'s contents, not its mtime, so

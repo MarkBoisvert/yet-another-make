@@ -8,32 +8,50 @@
 //! The record is part of the build state file ([`super::State`]). Staleness uses it
 //! to know each compile's inputs, and the scan cache to notice a header change.
 
-use std::collections::HashMap;
 use std::path::Path;
+
+use rustc_hash::FxHashMap;
 
 use super::state::Record;
 use crate::manifest::slash_path;
 
 /// Headers by object file, loaded from the last build and updated by this one.
+///
+/// Header paths are interned: each distinct header is stored once and objects list
+/// header ids, so a no-op build compares and hashes small integers rather than the
+/// same path strings over and over (#65).
 #[derive(Debug, Default)]
 pub struct HeaderRecord {
-    /// Object path → headers, each relative to the project root with `/` separators
+    /// Each header's path, by id: relative to the project root with `/` separators
     /// when inside it, otherwise absolute.
-    entries: HashMap<String, Vec<String>>,
+    names: Vec<String>,
+    name_ids: FxHashMap<String, u32>,
+    /// Object path → its headers' ids.
+    entries: FxHashMap<String, Vec<u32>>,
     changed: bool,
     /// Records for the journal since it was last written.
     pending: Vec<Record>,
 }
 
 impl HeaderRecord {
-    pub(super) fn from_entries(entries: HashMap<String, Vec<String>>) -> Self {
+    /// A record from its tables, as the state file stores them. Every id in
+    /// `entries` indexes `names`.
+    pub(super) fn from_parts(names: Vec<String>, entries: FxHashMap<String, Vec<u32>>) -> Self {
+        let name_ids = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), u32::try_from(i).unwrap_or(u32::MAX)))
+            .collect();
         Self {
+            names,
+            name_ids,
             entries,
             ..Self::default()
         }
     }
 
-    pub(super) fn entries(&self) -> &HashMap<String, Vec<String>> {
+    /// Object path → header ids.
+    pub(super) fn entries(&self) -> &FxHashMap<String, Vec<u32>> {
         &self.entries
     }
 
@@ -54,28 +72,56 @@ impl HeaderRecord {
     }
 
     /// Forget objects that no longer exist. Done only when the state is written
-    /// anyway, so a no-op build doesn't stat every object.
+    /// anyway, so a no-op build doesn't stat every object. Headers no object uses any
+    /// more are dropped when the state is next loaded.
     pub(super) fn prune(&mut self) {
         self.entries.retain(|object, _| Path::new(object).exists());
     }
 
-    /// The headers `object` was last compiled with; empty if it never was.
+    /// The ids of the headers `object` was last compiled with; empty if it never was.
     #[must_use]
-    pub fn get(&self, object: &Path) -> &[String] {
-        self.entries.get(&key(object)).map_or(&[], Vec::as_slice)
+    pub fn get(&self, object: &Path) -> &[u32] {
+        let entry = match object.to_str() {
+            Some(text) => self.entries.get(text),
+            None => self.entries.get(&key(object)),
+        };
+        entry.map_or(&[], Vec::as_slice)
+    }
+
+    /// A header's path, by id.
+    #[must_use]
+    pub fn name(&self, id: u32) -> &str {
+        &self.names[id as usize]
+    }
+
+    /// The paths of the headers `object` was last compiled with.
+    #[must_use]
+    pub fn names_of(&self, object: &Path) -> Vec<&str> {
+        self.get(object).iter().map(|&id| self.name(id)).collect()
     }
 
     /// Record that `object` was compiled with `headers`.
     pub fn record(&mut self, object: &Path, headers: Vec<String>) {
+        let ids: Vec<u32> = headers.iter().map(|header| self.intern(header)).collect();
         let key = key(object);
-        if self.entries.get(&key) != Some(&headers) {
+        if self.entries.get(&key) != Some(&ids) {
             self.pending.push(Record::Headers {
                 object: key.clone(),
-                headers: headers.clone(),
+                headers,
             });
-            self.entries.insert(key, headers);
+            self.entries.insert(key, ids);
             self.changed = true;
         }
+    }
+
+    fn intern(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.name_ids.get(name) {
+            return id;
+        }
+        let id = u32::try_from(self.names.len()).unwrap_or(u32::MAX);
+        self.names.push(name.to_string());
+        self.name_ids.insert(name.to_string(), id);
+        id
     }
 }
 
@@ -123,16 +169,16 @@ mod tests {
 
         let (mut state, errors) = State::load(&state_dir);
         assert!(errors.is_empty());
-        assert_eq!(state.headers.get(&kept), &[] as &[String]);
+        assert_eq!(state.headers.get(&kept), &[] as &[u32]);
         state.headers.record(&kept, vec!["src/a.hpp".into()]);
         state.headers.record(&gone, vec!["src/b.hpp".into()]);
         state.save().unwrap();
 
         let (mut state, _) = State::load(&state_dir);
-        assert_eq!(state.headers.get(&kept), ["src/a.hpp"]);
+        assert_eq!(state.headers.names_of(&kept), ["src/a.hpp"]);
         assert_eq!(
             state.headers.get(&gone),
-            &[] as &[String],
+            &[] as &[u32],
             "missing objects are dropped"
         );
 
