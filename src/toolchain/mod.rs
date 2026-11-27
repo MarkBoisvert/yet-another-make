@@ -785,16 +785,21 @@ mod tests {
         let upgraded = fingerprint(&search, &toolchain);
         assert_ne!(upgraded, first);
 
-        // A new tool in a directory on `PATH`, which could shadow the one found.
-        let file = fs::File::options().write(true).open(clang).unwrap();
-        file.set_modified(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap();
-        let settled = fingerprint(&search, &toolchain);
-        tool(&temp.path().join("bin"), "clang++", "23.1.0");
-        let bin = fs::File::open(temp.path().join("bin")).unwrap();
-        bin.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7))
-            .unwrap();
-        assert_ne!(fingerprint(&search, &toolchain), settled);
+        // A new tool in a directory on `PATH`, which could shadow the one found. The
+        // directory's mtime is set by hand so the test doesn't depend on the clock's
+        // resolution; Windows can't open a directory to do that.
+        #[cfg(unix)]
+        {
+            let file = fs::File::options().write(true).open(clang).unwrap();
+            file.set_modified(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+            let settled = fingerprint(&search, &toolchain);
+            tool(&temp.path().join("bin"), "clang++", "23.1.0");
+            let bin = fs::File::open(temp.path().join("bin")).unwrap();
+            bin.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7))
+                .unwrap();
+            assert_ne!(fingerprint(&search, &toolchain), settled);
+        }
 
         // A different override or `PATH`.
         let mut overridden = search.clone();
