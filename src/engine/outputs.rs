@@ -17,7 +17,6 @@
 //! The record is part of the build state file ([`super::State`]). Paths and hashes
 //! are interned, so each input of each output is two small numbers.
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +25,7 @@ use std::time::UNIX_EPOCH;
 use rustc_hash::FxHashMap;
 
 use super::state::Record;
+use super::strings::StrTable;
 
 /// A hash of an output's whole command, including the tools that run it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,17 +103,42 @@ impl Stat {
     }
 }
 
-/// An output's command hash and `(path id, hash id)` per input.
-pub(super) type Entry = ([u8; 32], Vec<(u32, u32)>);
+/// An output's command hash, and where its inputs are in the record's input
+/// buffer: a `(path id, hash id)` per input. Every output's inputs share one
+/// buffer, so loading the record allocates once for all of them, not once per
+/// output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Entry {
+    pub command: [u8; 32],
+    start: u32,
+    len: u32,
+}
+
+impl Entry {
+    pub(super) fn new(command: [u8; 32], start: u32, len: u32) -> Self {
+        Self {
+            command,
+            start,
+            len,
+        }
+    }
+
+    /// Where its inputs are in the input buffer.
+    pub(super) fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.start as usize + self.len as usize
+    }
+}
 
 /// The record's tables, as the state file writes them.
 pub(super) struct Tables<'a> {
-    pub paths: &'a [String],
+    pub paths: &'a StrTable,
     pub hashes: &'a [[u8; 32]],
-    /// By path id: the stat and contents hash id yam last saw.
-    pub seen: &'a HashMap<u32, (Stat, u32)>,
-    /// By output path.
-    pub entries: &'a HashMap<String, Entry>,
+    /// By path id: the stat and contents hash id yam last saw, if it saw the file.
+    pub seen: &'a [Option<(Stat, u32)>],
+    /// By output path id.
+    pub entries: &'a FxHashMap<u32, Entry>,
+    /// Every entry's inputs, by [`Entry::range`].
+    pub inputs: &'a [(u32, u32)],
 }
 
 /// What this build knows of a file. Each file is `stat`ed at most once a build,
@@ -132,16 +157,32 @@ enum Current {
     Hash(u32),
 }
 
+/// Files to `stat` ahead of the build checking them, and what was found; see
+/// [`Outputs::prefetch`].
+#[derive(Debug, Default)]
+pub struct Prefetch {
+    ids: Vec<u32>,
+    /// By position in `ids`, filled in by the workers.
+    found: Vec<Current>,
+    /// How many workers to start; 0 for none.
+    threads: usize,
+}
+
 /// The output record, loaded from the last build and updated by this one.
+///
+/// Every path, input or output, is interned in one [`StrTable`]; everything else
+/// refers to files by path id, so a check compares integers rather than paths.
 #[derive(Default)]
 pub struct Outputs {
-    paths: Vec<String>,
+    paths: StrTable,
     hashes: Vec<[u8; 32]>,
     /// What yam last saw of each file, by path id: its stat and contents hash id.
-    seen: HashMap<u32, (Stat, u32)>,
-    /// By output path.
-    entries: HashMap<String, Entry>,
-    path_ids: FxHashMap<String, u32>,
+    seen: Vec<Option<(Stat, u32)>>,
+    /// By output path id.
+    entries: FxHashMap<u32, Entry>,
+    /// Every entry's inputs, back to back. A rerecorded output's new inputs are
+    /// appended, and the state file keeps only the live ones.
+    inputs: Vec<(u32, u32)>,
     hash_ids: FxHashMap<[u8; 32], u32>,
     /// By path id: each file's contents as of this build, so each file is checked
     /// once.
@@ -155,22 +196,24 @@ impl Outputs {
     /// A record from its tables, as the state file stores them. `None` if an id is
     /// out of range.
     pub(super) fn from_parts(
-        paths: Vec<String>,
+        paths: StrTable,
         hashes: Vec<[u8; 32]>,
-        seen: HashMap<u32, (Stat, u32)>,
-        entries: HashMap<String, Entry>,
+        seen: Vec<Option<(Stat, u32)>>,
+        entries: FxHashMap<u32, Entry>,
+        inputs: Vec<(u32, u32)>,
     ) -> Option<Self> {
-        let path_ok = |id: u32| (id as usize) < paths.len();
+        let path_ok = |id: u32| id < paths.len();
         let hash_ok = |id: u32| (id as usize) < hashes.len();
-        let valid = seen.iter().all(|(&p, &(_, h))| path_ok(p) && hash_ok(h))
+        let valid = seen.len() <= paths.len() as usize
+            && seen.iter().flatten().all(|&(_, h)| hash_ok(h))
             && entries
-                .values()
-                .all(|(_, inputs)| inputs.iter().all(|&(p, h)| path_ok(p) && hash_ok(h)));
+                .iter()
+                .all(|(&output, entry)| path_ok(output) && entry.range().end <= inputs.len())
+            && inputs.iter().all(|&(p, h)| path_ok(p) && hash_ok(h));
         if !valid {
             return None;
         }
         Some(Self {
-            path_ids: index(&paths),
             hash_ids: hashes
                 .iter()
                 .enumerate()
@@ -180,6 +223,7 @@ impl Outputs {
             hashes,
             seen,
             entries,
+            inputs,
             ..Self::default()
         })
     }
@@ -191,6 +235,7 @@ impl Outputs {
             hashes: &self.hashes,
             seen: &self.seen,
             entries: &self.entries,
+            inputs: &self.inputs,
         }
     }
 
@@ -222,11 +267,12 @@ impl Outputs {
             let path = self.intern(Path::new(path));
             let hash = self.hash_id(hash);
             if let Some(stat) = stat {
-                self.seen.insert(path, (*stat, hash));
+                self.set_seen(path, *stat, hash);
             }
             recorded.push((path, hash));
         }
-        self.entries.insert(output.to_string(), (command, recorded));
+        let output = self.intern(Path::new(output));
+        self.set_entry(output, command, &recorded);
         self.changed = true;
     }
 
@@ -252,11 +298,11 @@ impl Outputs {
     /// [`Self::intern`].
     pub fn is_fresh_ids(&mut self, output: u32, command: CommandHash, inputs: &[u32]) -> bool {
         let current: Vec<Option<u32>> = inputs.iter().map(|&id| self.current_hash(id)).collect();
-        let Some((recorded_command, recorded)) = self.entries.get(&self.paths[output as usize])
-        else {
+        let Some(entry) = self.entries.get(&output) else {
             return false;
         };
-        let matches = *recorded_command == command.0
+        let recorded = &self.inputs[entry.range()];
+        let matches = entry.command == command.0
             && recorded.len() == inputs.len()
             && recorded.iter().zip(inputs.iter().zip(&current)).all(
                 |(&(path, hash), (&now_path, &now_hash))| {
@@ -278,53 +324,101 @@ impl Outputs {
     /// no-op build that's nearly every `stat` it makes, and they're most of its
     /// time; the kernel answers them in parallel.
     ///
-    /// Only worth calling before anything has been checked. A file a step writes
-    /// later is forgotten by [`Self::invalidate`] as usual, so stating early changes
-    /// nothing a sequential check wouldn't have seen.
+    /// This waits for the `stat`s. A build instead starts them with
+    /// [`Self::prefetch_plan`] and [`Self::prefetch_spawn`], does other work while
+    /// they run, and hands the results back with [`Self::prefetch_apply`].
     pub fn prefetch(&mut self, threads: usize) {
+        let mut plan = self.prefetch_plan(threads);
+        std::thread::scope(|scope| {
+            for worker in self.prefetch_spawn(scope, &mut plan) {
+                // A worker that panicked leaves the rest of its files unchecked, to
+                // be checked as they come up.
+                let _ = worker.join();
+            }
+        });
+        self.prefetch_apply(plan);
+    }
+
+    /// Which files [`Self::prefetch`] would `stat`, and on how many threads: none
+    /// when there are too few files to be worth starting threads for.
+    #[must_use]
+    pub fn prefetch_plan(&self, threads: usize) -> Prefetch {
         /// Below this many files per thread, starting threads costs more than it
         /// saves.
         const MIN_PER_THREAD: usize = 512;
         /// More threads than this measured no faster.
         const MAX_THREADS: usize = 8;
-        let mut wanted = vec![false; self.paths.len()];
-        for (output, (_, inputs)) in &self.entries {
-            if let Some(&id) = self.path_ids.get(output) {
-                wanted[id as usize] = true;
-            }
-            for &(id, _) in inputs {
+        let mut wanted = vec![false; self.paths.len() as usize];
+        for (&output, entry) in &self.entries {
+            wanted[output as usize] = true;
+            for &(id, _) in &self.inputs[entry.range()] {
                 wanted[id as usize] = true;
             }
         }
         let ids: Vec<u32> = (0..self.paths.len())
-            .filter(|&i| {
-                wanted[i] && matches!(self.current.get(i), None | Some(Current::Unchecked))
+            .filter(|&id| {
+                wanted[id as usize]
+                    && matches!(
+                        self.current.get(id as usize),
+                        None | Some(Current::Unchecked)
+                    )
             })
-            .map(|i| u32::try_from(i).unwrap_or(u32::MAX))
             .collect();
         let threads = threads.min(MAX_THREADS).min(ids.len() / MIN_PER_THREAD);
         if threads < 2 {
-            return;
+            return Prefetch::default();
+        }
+        Prefetch {
+            found: vec![Current::Unchecked; ids.len()],
+            ids,
+            threads,
+        }
+    }
+
+    /// Start `plan`'s `stat`s on threads in `scope`. The record can still be read
+    /// while they run; join the returned workers, then apply the plan.
+    ///
+    /// Each worker writes into its own slice of the plan, allocated beforehand: a
+    /// thread that never allocates never makes the allocator set up a heap for it,
+    /// which cost more than the `stat`s it saved.
+    pub fn prefetch_spawn<'scope, 'env>(
+        &'env self,
+        scope: &'scope std::thread::Scope<'scope, 'env>,
+        plan: &'env mut Prefetch,
+    ) -> Vec<std::thread::ScopedJoinHandle<'scope, ()>> {
+        if plan.threads == 0 {
+            return Vec::new();
         }
         let paths = &self.paths;
-        let stat = |id: &u32| {
-            Stat::of(Path::new(&paths[*id as usize])).map_or(Current::Missing, Current::Stat)
-        };
-        let found: Vec<Vec<Current>> = std::thread::scope(|scope| {
-            let workers: Vec<_> = ids
-                .chunks(ids.len().div_ceil(threads))
-                .map(|chunk| scope.spawn(move || chunk.iter().map(stat).collect()))
-                .collect();
-            // A worker that panicked leaves its files to be checked as they come up.
-            workers
-                .into_iter()
-                .map(|worker| worker.join().unwrap_or_default())
-                .collect()
-        });
-        self.current.resize(self.paths.len(), Current::Unchecked);
-        for (chunk, found) in ids.chunks(ids.len().div_ceil(threads)).zip(found) {
-            for (&id, current) in chunk.iter().zip(found) {
-                self.current[id as usize] = current;
+        let chunk = plan.ids.len().div_ceil(plan.threads);
+        plan.ids
+            .chunks(chunk)
+            .zip(plan.found.chunks_mut(chunk))
+            .map(|(ids, found)| {
+                scope.spawn(move || {
+                    for (&id, slot) in ids.iter().zip(found) {
+                        *slot = Stat::of(Path::new(paths.get(id)))
+                            .map_or(Current::Missing, Current::Stat);
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// Take in what `plan`'s workers found. Files `stat`ed this way are as good as
+    /// checked now; one a step writes later is forgotten by [`Self::invalidate`] as
+    /// usual, so stating early changes nothing a sequential check wouldn't see.
+    pub fn prefetch_apply(&mut self, plan: Prefetch) {
+        if plan.ids.is_empty() {
+            return;
+        }
+        self.current
+            .resize(self.paths.len() as usize, Current::Unchecked);
+        for (&id, found) in plan.ids.iter().zip(plan.found) {
+            // A file checked while the workers ran keeps what that check saw.
+            let slot = &mut self.current[id as usize];
+            if matches!(slot, Current::Unchecked) {
+                *slot = found;
             }
         }
     }
@@ -342,42 +436,49 @@ impl Outputs {
                 None => complete = false,
             }
         }
-        let key = key(output);
+        let output = self.intern(output);
         if !complete {
-            self.changed |= self.entries.remove(&key).is_some();
+            self.changed |= self.entries.remove(&output).is_some();
             return;
         }
-        let entry = (command.0, recorded);
-        if self.entries.get(&key) == Some(&entry) {
+        if self.entries.get(&output).is_some_and(|entry| {
+            entry.command == command.0 && self.inputs[entry.range()] == recorded[..]
+        }) {
             return;
         }
         self.pending.push(Record::Output {
-            output: key.clone(),
+            output: self.paths.get(output).to_string(),
             command: command.0,
-            inputs: entry
-                .1
+            inputs: recorded
                 .iter()
                 .map(|&(path, hash)| {
                     let stat = self
-                        .seen
-                        .get(&path)
+                        .seen(path)
                         .filter(|(_, seen)| *seen == hash)
-                        .map(|(stat, _)| *stat);
+                        .map(|(stat, _)| stat);
                     (
-                        self.paths[path as usize].clone(),
+                        self.paths.get(path).to_string(),
                         self.hashes[hash as usize],
                         stat,
                     )
                 })
                 .collect(),
         });
-        self.entries.insert(key, entry);
+        self.set_entry(output, command.0, &recorded);
         self.changed = true;
+    }
+
+    /// Make `output`'s entry `command` and `inputs`, appended to the input buffer.
+    fn set_entry(&mut self, output: u32, command: [u8; 32], inputs: &[(u32, u32)]) {
+        let start = u32::try_from(self.inputs.len()).unwrap_or(u32::MAX);
+        let len = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
+        self.inputs.extend_from_slice(inputs);
+        self.entries.insert(output, Entry::new(command, start, len));
     }
 
     /// Forget what this build knows of `path`, because a step just wrote it.
     pub fn invalidate(&mut self, path: &Path) {
-        if let Some(&id) = self.path_ids.get(&key(path))
+        if let Some(id) = self.find(path)
             && let Some(slot) = self.current.get_mut(id as usize)
         {
             *slot = Current::Unchecked;
@@ -398,22 +499,38 @@ impl Outputs {
         Some(blake3::Hash::from_bytes(self.hashes[hash as usize]))
     }
 
-    /// The record's id for `path`, adding it if it's new. Ids are stable for the
-    /// rest of the build, so a caller can look a path up once and keep its id.
+    /// The record's id for `path`, adding it if it's new. Ids are stable, so a
+    /// caller can look a path up once and keep its id; other records (the header
+    /// record) refer to files by these ids too.
     pub fn intern(&mut self, path: &Path) -> u32 {
-        // Looked up without allocating; nearly every path is already known.
-        if let Some(&id) = path.to_str().and_then(|text| self.path_ids.get(text)) {
+        if let Some(id) = self.find(path) {
             return id;
         }
-        let key = key(path);
-        if let Some(&id) = self.path_ids.get(&key) {
-            return id;
-        }
-        let id = u32::try_from(self.paths.len()).unwrap_or(u32::MAX);
-        self.paths.push(key.clone());
-        self.path_ids.insert(key, id);
+        let (id, _) = self.paths.intern(&path.to_string_lossy());
         self.changed = true;
         id
+    }
+
+    /// The id of `path`, if the record has one.
+    #[must_use]
+    pub fn find(&self, path: &Path) -> Option<u32> {
+        match path.to_str() {
+            // Looked up without allocating; nearly every path is valid UTF-8.
+            Some(text) => self.paths.find(text),
+            None => self.paths.find(&path.to_string_lossy()),
+        }
+    }
+
+    /// How many paths the record has; ids are `0..path_count()`.
+    #[must_use]
+    pub fn path_count(&self) -> u32 {
+        self.paths.len()
+    }
+
+    /// Path `id`.
+    #[must_use]
+    pub fn path(&self, id: u32) -> &str {
+        self.paths.get(id)
     }
 
     fn hash_id(&mut self, hash: &[u8; 32]) -> u32 {
@@ -427,6 +544,18 @@ impl Outputs {
         id
     }
 
+    fn seen(&self, id: u32) -> Option<(Stat, u32)> {
+        self.seen.get(id as usize).copied().flatten()
+    }
+
+    fn set_seen(&mut self, id: u32, stat: Stat, hash: u32) {
+        let slot = id as usize;
+        if self.seen.len() <= slot {
+            self.seen.resize(slot + 1, None);
+        }
+        self.seen[slot] = Some((stat, hash));
+    }
+
     /// The file's contents hash id now: reused from the last time yam saw it when
     /// its stat is unchanged, otherwise read and hashed.
     fn current_hash(&mut self, id: u32) -> Option<u32> {
@@ -435,11 +564,11 @@ impl Outputs {
             Current::Missing | Current::Unreadable | Current::Unchecked => return None,
             Current::Stat(stat) => stat,
         };
-        let hash = match self.seen.get(&id) {
-            Some(&(seen, hash)) if seen == stat => Some(hash),
-            _ => fs::read(&self.paths[id as usize]).ok().map(|bytes| {
+        let hash = match self.seen(id) {
+            Some((seen, hash)) if seen == stat => Some(hash),
+            _ => fs::read(self.paths.get(id)).ok().map(|bytes| {
                 let hash = self.hash_id(blake3::hash(&bytes).as_bytes());
-                self.seen.insert(id, (stat, hash));
+                self.set_seen(id, stat, hash);
                 self.changed = true;
                 hash
             }),
@@ -458,22 +587,10 @@ impl Outputs {
         }
         if let Current::Unchecked = self.current[slot] {
             self.current[slot] =
-                Stat::of(Path::new(&self.paths[slot])).map_or(Current::Missing, Current::Stat);
+                Stat::of(Path::new(self.paths.get(id))).map_or(Current::Missing, Current::Stat);
         }
         self.current[slot]
     }
-}
-
-fn index(items: &[String]) -> FxHashMap<String, u32> {
-    items
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (item.clone(), u32::try_from(i).unwrap_or(u32::MAX)))
-        .collect()
-}
-
-fn key(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -695,5 +812,25 @@ mod tests {
         let (mut state, _) = State::load(&state_dir);
         state.outputs.prefetch(4);
         assert!(!state.outputs.is_fresh(&output, command("cc"), &inputs));
+    }
+
+    #[test]
+    fn rerecorded_inputs_are_dropped_from_the_saved_buffer() {
+        let p = project();
+        let mut state = built(&p);
+        assert_eq!(state.outputs.parts().inputs.len(), 2);
+        // Recording again with one input appends to the buffer in memory.
+        state
+            .outputs
+            .record(&p.object, command("cc2"), std::slice::from_ref(&p.source));
+        assert_eq!(state.outputs.parts().inputs.len(), 3);
+        state.save().unwrap();
+        let mut state = p.load();
+        assert_eq!(state.outputs.parts().inputs.len(), 1);
+        assert!(
+            state
+                .outputs
+                .is_fresh(&p.object, command("cc2"), [&p.source])
+        );
     }
 }

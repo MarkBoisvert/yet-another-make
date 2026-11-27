@@ -220,14 +220,33 @@ named in `links`.
 - **One `stat` per file per build** (#67). Whether a file's existence (an output) or its
   contents (an input) is asked about first, the answer is kept for the rest of the
   build, so an object that's both a compile's output and the archive's input is
-  `stat`ed once. Before the scan, every file the recorded outputs name is `stat`ed on
-  up to 8 threads (when there are at least 512 per thread); the checks that follow
-  find them done. A file a step writes is forgotten and checked again, as before.
+  `stat`ed once. Right after the state file loads, every file the recorded outputs
+  name is `stat`ed on up to 8 threads (when there are at least 512 per thread),
+  while the main thread reads the manifest, walks the sources and checks the
+  toolchain; the checks that follow find them done. The workers write into slices
+  allocated up front, so they never allocate and the allocator never sets up a heap
+  for them. A file a step writes is forgotten and checked again, as before.
 - **A fresh compile isn't put together** (#67). Each target's shared compile flags (`-std`,
   profile flags, module and include directories) are built and hashed once, and each
-  file's paths are joined and interned once. Checking a file hashes only its last
-  few arguments on top of the target's hash; the `Command` is only built if the file
-  is stale. Debug builds check that this hash equals the full command's.
+  file's paths are joined and interned once. The `Command` is only built if the file
+  is stale.
+- **What a command hash covers** (#69). A compile's arguments after the shared flags
+  depend only on the file's path, its module and whether it needs
+  `-x c++-module`. So each target hashes those arguments once, written with
+  placeholders for the file and module, and each file adds just its relative path
+  and module name. Changing how those arguments are built changes the placeholder
+  version, and with it every hash. Archive and link hashes leave out the object
+  list: the objects are the step's first inputs, compared one by one and in order,
+  so a different list is stale anyway.
+- **Paths are ids** (#69). The output record interns every path, input or output, in one
+  string table, and keys each output's entry by its path id. The header record keys
+  objects by the same ids, so checking a file compares integers, not paths.
+- **A few large buffers, not many small ones** (#69). Every output's inputs share one
+  buffer, as do every object's header ids; each is allocated once, at its final
+  size, when the state file loads. Module names in scan results are shared
+  (`Arc<str>`), so loading them allocates each distinct name once, however many
+  files import it. A no-op build spends much of its time setting up memory, so
+  fewer, larger allocations are faster.
 - **Inputs are recorded as they were checked,** before the step ran. A file edited
   while it was being compiled is seen as changed by the next build.
 - **Restat, like ninja's:** an importer compares a `.pcm`'s contents, not its mtime, so
@@ -250,8 +269,12 @@ before the source walk (`src/engine/state.rs`). It's a hand-rolled binary format
 
 - **Layout:** fixed-width little-endian fields.
   - header: magic `YAMSTATE`, format version, yam version
-  - one table of every string; everything else refers to a string by index, so each
-    path is stored once
+  - one table of every other string; everything else refers to a string by index, so
+    each string is stored once
+  - the output record's paths and the header names are each a string table of
+    their own: the count, where each string ends, then all their bytes back to
+    back. Loading one is one copy and one UTF-8 check, not an allocation and a copy
+    per string. Entries refer to files by path id
   - sections, in order:
     - outputs: their paths and contents hashes (interned), what yam last saw of each
       file (mtime, size, hash), and each output's command hash and inputs (#24)

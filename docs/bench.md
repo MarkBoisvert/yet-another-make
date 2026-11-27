@@ -169,6 +169,75 @@ The same four binaries (before is #65), timed together, median of three
   (~14%), decoding the state file's strings, and the remaining small copies.
 
 
+### Strings, ids, hashes, buffers and huge pages (#69)
+
+The #67 profile still showed musl's `memcpy` and `memcmp` at about 17% of a modules
+no-op, roughly the whole gap to glibc. These changes remove most of those calls,
+and the rest of the time they save helps glibc too:
+- **String tables in one buffer.** The output record's paths and the header names
+  are each one buffer plus end offsets, in memory and in the state file (format
+  v3). Loading the ~10k paths of a 1k-unit project is one copy, not an allocation
+  and a copy per path.
+- **Records keyed by path id.** Output entries and header entries are found by
+  integer path id instead of by path string, and `seen` is a vector by id.
+- **Smaller command hashes.** Each target hashes its per-file compile arguments
+  once, with placeholders, so a file adds only its relative path and module name.
+  Archive and link hashes skip the object list, which is already compared as their
+  inputs.
+- **Prefetch workers that don't allocate.** After the above, a third of mimalloc's
+  fresh-page setup was the prefetch threads: each allocated its own results, so
+  mimalloc set up a heap per thread. They now write into slices allocated up front.
+- **Prefetch alongside startup.** The `stat`s start right after the state file
+  loads and run while the main thread reads the manifest, walks the sources and
+  checks the toolchain, rather than while it waits.
+- **A few large buffers.** Every output's inputs share one buffer, as do every
+  object's header ids, each allocated once at its final size; growing them as they
+  filled moved them into fresh memory each time. Scan results' module names are
+  shared, so each distinct name is allocated once.
+- **No transparent huge pages** (mimalloc's `no_thp` feature). A no-op touches
+  about 10 MB, but with huge pages that became 30–40 MB of 2 MiB pages the kernel
+  had to zero, and small layout changes moved it by 10 MB either way. Resident
+  memory is now about 10 MB. Only mimalloc's own `madvise` is dropped, so the
+  compilers yam starts keep the system's setting.
+
+The format change and the new hashes mean one full rebuild after upgrading.
+
+`main` after #67 against this change, median of three `hyperfine` rounds of 50
+runs:
+
+| No-op, 1k units | glibc, before | glibc, after | musl, before | musl, after | `ninja` alone |
+|---|---|---|---|---|---|
+| legacy | 14.2 ms | 11.7 ms | 15.5 ms | 11.7 ms | 35 ms |
+| modules | 16.9 ms | 11.3 ms | 20.0 ms | 11.4 ms | 54 ms |
+
+- **musl is within 0–6% of glibc,** from 9–18% slower before. This run had them
+  level (11.7 vs 11.7 ms legacy, 11.4 vs 11.3 ms modules); a second run of four
+  rounds had glibc ahead by 0.6–0.7 ms (11.3 vs 11.9 ms legacy, 11.0 vs 11.7 ms
+  modules). musl takes 21–34% of ninja's no-op time, and its CPU time fell from
+  11.7 to 7.1 ms on modules.
+- **The rest of the gap is user-space CPU:** 7.9–8.4 ms for musl against 6.1–7.0 ms
+  for glibc, with system time about equal. musl's slow small `memcpy`/`memcmp`
+  still show; its faster startup (no dynamic loader, about 0.5 ms) offsets part of
+  that.
+- **Roughly what each part saved on musl modules,** from runs in between: the string
+  tables, ids and hashes 19.2 → 13.9 ms; the allocation-free workers about 0.9 ms
+  of that again; running the prefetch alongside startup about 1 ms more; the
+  buffers about 1 ms more.
+- **The buffers and `no_thp` only pay together.** With huge pages on, the buffers
+  measured no faster: their memory landed in about 10 MB more huge pages, which cost
+  as much as they saved. With huge pages off (four rounds), the buffers beat the
+  version without them in every case: 12.8 → 11.8 ms on musl modules, 12.3 → 11.9 ms
+  on musl legacy, and 0.4–0.5 ms on glibc. Turning huge pages off without the
+  buffers changed nothing (12.8 ms on musl modules either way).
+- **Every scenario rebuilds the same files as before:** `touch`, `leaf-impl`,
+  `leaf-iface`, `impl-1pct`, `mid-iface` and `add-unit` compiled the same counts
+  with the old and new binaries, in both styles, and the build after each compiled
+  nothing.
+- **Tried and dropped:** a 64 KiB stack for the prefetch workers (musl unmaps
+  every exited thread's stack; glibc reuses them) made no measurable difference.
+- **What's left:** `stat` calls, which cost the same with either C library, and
+  setting up the memory a no-op build needs.
+
 ## Baseline: CMake + ninja
 
 Measured on 2026-10-11 with `bench run` defaults. yam's column fills in from #20 on.

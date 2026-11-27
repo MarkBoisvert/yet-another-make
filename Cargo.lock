@@ -859,6 +859,7 @@ dependencies = [
  "clap",
  "git2",
  "globset",
+ "hashbrown",
  "mimalloc",
  "proptest",
  "rustc-hash",

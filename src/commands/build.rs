@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ use anyhow::{Context, Result, bail};
 use crate::cli::BuildArgs;
 use crate::engine::{
     self, Action, CommandHash, CommandHasher, Deps, FlagsHash, GraphTarget, HeaderDigest,
-    HeaderRecord, Key, Plan, STD_MODULE, ScanJob, SourceFile, State,
+    HeaderRecord, Key, ModuleName, Plan, STD_MODULE, ScanJob, SourceFile, State,
 };
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
@@ -84,33 +84,57 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         .path
         .canonicalize()
         .with_context(|| format!("failed to resolve `{}`", args.path.display()))?;
-    let manifest = Manifest::load(&root)?;
     let profile = if args.release {
         Profile::Release
     } else {
         Profile::Debug
     };
+    let jobs = args.jobs.map_or_else(
+        || std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
+        |jobs| jobs as usize,
+    );
     let out = root.join("target").join(profile.dir_name());
     let mut caches = Caches::load(&out);
-    let tree = SourceTree::scan_cached(&root, &mut caches.state.dirs)?;
-    let diagnostics = validate_tree(&manifest, &root, &tree)?;
-    report(&diagnostics);
-    if has_errors(&diagnostics) {
-        bail!(
-            "could not build `{}` due to errors in `{}`",
-            manifest.project.name,
-            manifest::MANIFEST_FILE_NAME
-        );
-    }
-    if !manifest.dependencies.is_empty() {
-        style::warning(
-            "[dependencies] are ignored for now; dependency support comes with packages",
-        );
-    }
 
-    let targets = select(resolve_targets(&manifest, &root)?, args)?;
+    // Every file the last build recorded is about to be checked. Their `stat`s run
+    // on worker threads while this one reads the manifest, walks the sources and
+    // checks the toolchain, so on a no-op build they come almost for free.
+    let mut prefetch = caches.state.outputs.prefetch_plan(jobs);
+    let cached_toolchain = caches.state.toolchain().cloned();
+    let state = &mut caches.state;
+    let prepared = std::thread::scope(|scope| {
+        let workers = state.outputs.prefetch_spawn(scope, &mut prefetch);
+        let prepared = (|| -> Result<_> {
+            let manifest = Manifest::load(&root)?;
+            let tree = SourceTree::scan_cached(&root, &mut state.dirs)?;
+            let diagnostics = validate_tree(&manifest, &root, &tree)?;
+            report(&diagnostics);
+            if has_errors(&diagnostics) {
+                bail!(
+                    "could not build `{}` due to errors in `{}`",
+                    manifest.project.name,
+                    manifest::MANIFEST_FILE_NAME
+                );
+            }
+            if !manifest.dependencies.is_empty() {
+                style::warning(
+                    "[dependencies] are ignored for now; dependency support comes with packages",
+                );
+            }
+            let targets = select(resolve_targets(&manifest, &root)?, args)?;
+            let toolchain = Toolchain::discover_cached(cached_toolchain.as_ref())?;
+            Ok((manifest, tree, targets, toolchain))
+        })();
+        for worker in workers {
+            // A worker that panicked leaves the rest of its files unchecked, to be
+            // checked as they come up.
+            let _ = worker.join();
+        }
+        prepared
+    });
+    caches.state.outputs.prefetch_apply(prefetch);
+    let (manifest, tree, targets, (toolchain, discovered)) = prepared?;
     let selected = select_files(&root, &targets, &tree)?;
-    let (toolchain, discovered) = Toolchain::discover_cached(caches.state.toolchain())?;
     if let Some(discovered) = discovered {
         caches.state.set_toolchain(discovered);
     }
@@ -131,10 +155,7 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         profile,
         toolchain: &toolchain,
         verbose: args.verbose,
-        jobs: args.jobs.map_or_else(
-            || std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
-            |jobs| jobs as usize,
-        ),
+        jobs,
         keep_going: args.keep_going,
         caches: RefCell::new(caches),
         out,
@@ -561,7 +582,7 @@ impl Caches {
     }
 
     /// The scan key for a file, using the headers `object` was last compiled with.
-    fn key(&mut self, root: &Path, file: &FileKey, object: &Path) -> Key {
+    fn key(&mut self, root: &Path, file: &FileKey, object: u32) -> Key {
         let state = &mut self.state;
         let digests: Vec<HeaderDigest> = state
             .headers
@@ -626,7 +647,7 @@ struct Scanned {
     deps: Deps,
     key: FileKey,
     source: InternedPath,
-    object: PathBuf,
+    object: InternedPath,
 }
 
 /// What a file's scan key is made of, apart from its headers.
@@ -700,7 +721,7 @@ struct FilePaths {
 
 impl Prepared<'_> {
     /// The modules and partitions the target provides.
-    fn modules(&self) -> HashSet<String> {
+    fn modules(&self) -> HashSet<ModuleName> {
         self.plan
             .steps
             .iter()
@@ -972,8 +993,8 @@ impl Builder<'_> {
                         InternedPath::new(module_dir.join(pcm_name(&provided.name)), outputs)
                     });
                     paths.push(FilePaths {
-                        depfile: depfile_path(&scanned.object),
-                        object: InternedPath::new(scanned.object, outputs),
+                        depfile: depfile_path(&scanned.object.path),
+                        object: scanned.object,
                         source: scanned.source,
                         pcm,
                     });
@@ -994,7 +1015,7 @@ impl Builder<'_> {
             if plan.imports_std && !self.std.supports_import_std() {
                 let file = files
                     .iter()
-                    .find(|f| f.deps.requires.iter().any(|m| m == STD_MODULE))
+                    .find(|f| f.deps.requires.iter().any(|m| &**m == STD_MODULE))
                     .map_or("", |f| f.path.as_str());
                 bail!(
                     "`{file}` imports `std`, which needs c++23 or later, but the project's \
@@ -1031,11 +1052,8 @@ impl Builder<'_> {
             toolchain.cxx.version
         );
         let mut caches = self.caches.borrow_mut();
-        // Every file the last build recorded is about to be checked, starting with
-        // the sources here.
-        caches.state.outputs.prefetch(self.jobs);
 
-        let mut results: Vec<(Option<Deps>, FileKey, InternedPath, PathBuf)> = Vec::new();
+        let mut results: Vec<(Option<Deps>, FileKey, InternedPath, InternedPath)> = Vec::new();
         let mut misses = Vec::new();
         let mut jobs = Vec::new();
         for Selected { target, files } in selected {
@@ -1059,13 +1077,14 @@ impl Builder<'_> {
                     flags: flags.clone(),
                     contents,
                 };
-                let output = object_file(&obj_dir, file);
-                let key = caches.key(self.root, &file_key, &output);
+                let output =
+                    InternedPath::new(object_file(&obj_dir, file), &mut caches.state.outputs);
+                let key = caches.key(self.root, &file_key, output.id);
                 if let Some(deps) = caches.state.scan.get(key) {
                     results.push((Some(deps), file_key, source, output));
                     continue;
                 }
-                create_parent(&output)?;
+                create_parent(&output.path)?;
                 let arguments = std::iter::once(command.get_program())
                     .chain(command.get_args())
                     .map(ToOwned::to_owned)
@@ -1073,13 +1092,13 @@ impl Builder<'_> {
                         "-c".into(),
                         source.path.clone().into_os_string(),
                         "-o".into(),
-                        output.clone().into_os_string(),
+                        output.path.clone().into_os_string(),
                     ])
                     .collect();
                 misses.push((results.len(), key));
                 jobs.push(ScanJob {
                     source: source.path.clone(),
-                    output: output.clone(),
+                    output: output.path.clone(),
                     arguments,
                 });
                 results.push((None, file_key, source, output));
@@ -1201,6 +1220,26 @@ impl Builder<'_> {
         for arg in &args {
             hasher.arg(arg);
         }
+        // What every file adds to these, written with placeholders for the file and
+        // module: see `compile_hash`.
+        let (obj_dir, _) = self.target_dirs(target);
+        let source = self.root.join(TEMPLATE_FILE);
+        let object = object_file(&obj_dir, TEMPLATE_FILE);
+        let depfile = depfile_path(&object);
+        let pcm = module_dir.join(pcm_name(TEMPLATE_MODULE));
+        hasher.encoded(b"\0\x01per-file");
+        for (pcm, needs_language) in [(Some(&pcm), true), (Some(&pcm), false), (None, false)] {
+            hasher.encoded(b"\0\x01variant");
+            for arg in compile_suffix(
+                pcm.map(PathBuf::as_path),
+                needs_language,
+                &depfile,
+                &source,
+                &object,
+            ) {
+                hasher.arg(arg);
+            }
+        }
         CompileFlags { args, hasher }
     }
 
@@ -1229,14 +1268,20 @@ impl Builder<'_> {
         // declares a module needs saying so.
         let needs_language =
             paths.pcm.is_some() && !engine::has_extension(&prepared.files[file].path, "cppm");
-        let command = compile_hash(flags, paths, needs_language);
+        let module = prepared.files[file].deps.provides.as_ref();
+        let command = compile_hash(
+            flags,
+            &prepared.files[file].path,
+            module.map(|m| &*m.name),
+            needs_language,
+        );
 
         let fresh = {
             let mut caches = self.caches.borrow_mut();
             let Caches {
                 state, header_info, ..
             } = &mut *caches;
-            let headers = state.headers.get(&paths.object.path);
+            let headers = state.headers.get(paths.object.id);
             let mut inputs = Vec::with_capacity(1 + headers.len() + pcms.len());
             inputs.push(paths.source.id);
             for &id in headers {
@@ -1263,27 +1308,13 @@ impl Builder<'_> {
         }
 
         let mut compile = Command::new(&flags.args[0]);
-        compile.args(&flags.args[1..]);
-        if let Some(pcm) = &paths.pcm {
-            let mut output = OsString::from("-fmodule-output=");
-            output.push(&pcm.path);
-            compile.arg(output);
-            if needs_language {
-                compile.args(["-x", "c++-module"]);
-            }
-        }
-        // The output is captured, so colors are asked for explicitly; printing it
-        // strips them again when they aren't wanted.
-        compile
-            .arg("-fdiagnostics-color=always")
-            .arg("-MMD")
-            .arg("-MF")
-            .arg(&paths.depfile)
-            .arg("-c")
-            .arg(&paths.source.path)
-            .arg("-o")
-            .arg(&paths.object.path);
-        debug_assert_eq!(command, command_hash(&self.tools(), &compile));
+        compile.args(&flags.args[1..]).args(compile_suffix(
+            paths.pcm.as_ref().map(|pcm| pcm.path.as_path()),
+            needs_language,
+            &paths.depfile,
+            &paths.source.path,
+            &paths.object.path,
+        ));
 
         create_parent(&paths.object.path)?;
         if let Some(pcm) = &paths.pcm {
@@ -1327,9 +1358,13 @@ impl Builder<'_> {
         let source = self.root.join(&prepared.files[file].path);
         let deps = fs::read_to_string(depfile).map_or_default(|text| engine::depfile::parse(&text));
         let headers = engine::headers_from_depfile(deps, self.root, &source);
+        let id = prepared.paths[file].object.id;
         let mut caches = self.caches.borrow_mut();
-        caches.state.headers.record(object, headers.clone());
-        let key = caches.key(self.root, &prepared.keys[file], object);
+        caches
+            .state
+            .headers
+            .record(id, &object.to_string_lossy(), headers.clone());
+        let key = caches.key(self.root, &prepared.keys[file], id);
         caches
             .state
             .scan
@@ -1355,6 +1390,16 @@ impl Builder<'_> {
         }
     }
 
+    /// A target's objects' ids in the output record, in plan order.
+    fn object_ids(prepared: &Prepared<'_>) -> Vec<u32> {
+        prepared
+            .plan
+            .steps
+            .iter()
+            .map(|step| prepared.paths[step.file].object.id)
+            .collect()
+    }
+
     /// A target's objects, in plan order.
     fn objects(prepared: &Prepared<'_>) -> Vec<PathBuf> {
         (0..prepared.plan.steps.len())
@@ -1365,7 +1410,6 @@ impl Builder<'_> {
     /// The job archiving the library's objects, unless the archive is fresh.
     fn archive_job(&self, prepared: &Prepared<'_>) -> Result<Option<Job>> {
         let target = prepared.target;
-        let objects = Self::objects(prepared);
         let archive = self.out.join(format!("lib{}.a", target.name));
         let before = [OsString::from("rcs"), archive.clone().into_os_string()];
         let command = CommandHash::new(
@@ -1373,18 +1417,18 @@ impl Builder<'_> {
             before
                 .iter()
                 .map(OsString::as_os_str)
-                .chain(objects.iter().map(|o| o.as_os_str())),
+                .chain([OsStr::new(OBJECTS)]),
         );
-        if self
-            .caches
-            .borrow_mut()
-            .state
-            .outputs
-            .is_fresh(&archive, command, &objects)
-        {
+        let fresh = {
+            let outputs = &mut self.caches.borrow_mut().state.outputs;
+            let archive = outputs.intern(&archive);
+            outputs.is_fresh_ids(archive, command, &Self::object_ids(prepared))
+        };
+        if fresh {
             return Ok(None);
         }
 
+        let objects = Self::objects(prepared);
         let _ = fs::remove_file(&archive);
         let mut ar = Command::new(&self.toolchain.ar);
         ar.args(&before);
@@ -1408,20 +1452,17 @@ impl Builder<'_> {
         lib: Option<&Lib>,
     ) -> Result<Option<Job>> {
         let target = prepared.target;
-        let mut objects = Self::objects(prepared);
-        if let Some(std) = std {
-            objects.push(std.object.clone());
-        }
         let executable = self
             .out
             .join(format!("{}{}", target.name, std::env::consts::EXE_SUFFIX));
 
-        // Everything after the objects; library files are inputs too.
+        // Everything after the objects; library files are inputs too, after the
+        // objects.
         let mut after: Vec<OsString> = Vec::new();
-        let mut inputs = objects.clone();
+        let mut libraries = Vec::new();
         if let Some(lib) = lib {
             after.push(lib.archive.clone().into_os_string());
-            inputs.push(lib.archive.clone());
+            libraries.push(lib.archive.clone());
         }
         // The bin's own libraries, then the project library's, which its archive
         // needs but can't carry.
@@ -1436,7 +1477,7 @@ impl Builder<'_> {
                 if is_link_path(name) {
                     let path = self.root.join(name);
                     after.push(path.clone().into_os_string());
-                    inputs.push(path);
+                    libraries.push(path);
                 } else {
                     after.push(format!("-l{name}").into());
                 }
@@ -1457,20 +1498,25 @@ impl Builder<'_> {
         let command = CommandHash::new(
             &self.tools(),
             std::iter::once(self.toolchain.cxx.path.as_os_str())
-                .chain([before.as_os_str()])
-                .chain(objects.iter().map(|o| o.as_os_str()))
+                .chain([before.as_os_str(), OsStr::new(OBJECTS)])
                 .chain(after.iter().map(OsString::as_os_str)),
         );
-        if self
-            .caches
-            .borrow_mut()
-            .state
-            .outputs
-            .is_fresh(&executable, command, &inputs)
-        {
+        let fresh = {
+            let outputs = &mut self.caches.borrow_mut().state.outputs;
+            let mut ids = Self::object_ids(prepared);
+            ids.extend(std.map(|std| outputs.intern(&std.object)));
+            ids.extend(libraries.iter().map(|path| outputs.intern(path)));
+            let executable = outputs.intern(&executable);
+            outputs.is_fresh_ids(executable, command, &ids)
+        };
+        if fresh {
             return Ok(None);
         }
 
+        let mut objects = Self::objects(prepared);
+        objects.extend(std.map(|std| std.object.clone()));
+        let mut inputs = objects.clone();
+        inputs.extend(libraries);
         let mut link = Command::new(&self.toolchain.cxx.path);
         link.arg(&before);
         self.add_files(&mut link, &objects, &target.name)?;
@@ -1508,36 +1554,75 @@ impl Builder<'_> {
     }
 }
 
-/// A hash of `command` as it will run, with `tools` identifying the compiler.
-fn command_hash(tools: &str, command: &Command) -> CommandHash {
-    CommandHash::new(
-        tools,
-        std::iter::once(command.get_program()).chain(command.get_args()),
-    )
+/// Stands for a target's objects in archive and link command hashes. The objects
+/// themselves aren't hashed: they're the step's first inputs, which the output
+/// record compares one by one, in order, so a different list is already stale.
+const OBJECTS: &str = "\u{1}objects";
+/// Stand-ins for the file and module in the per-file part of a target's compile
+/// command, hashed once per target; see [`compile_hash`].
+const TEMPLATE_FILE: &str = "\u{1}file";
+const TEMPLATE_MODULE: &str = "\u{1}module";
+
+/// The hash of the compile [`Builder::compile_job`] runs for `file` (relative to
+/// the root), which provides `module`, without putting the command together.
+///
+/// A compile command is the target's shared flags, then arguments that depend only
+/// on the file's path, its module and whether it needs `-x c++-module`. So
+/// `flags`' hash covers the shared flags plus those per-file arguments written
+/// with placeholders (see [`Builder::compile_flags`]), and each file adds just
+/// its path and module. A change to how the per-file arguments are built changes
+/// the placeholder version, and so every hash, and a different path, module or
+/// language flag is a different hash; checking a fresh file hashes a few short
+/// strings rather than every path in its command.
+fn compile_hash(
+    flags: &CompileFlags,
+    file: &str,
+    module: Option<&str>,
+    needs_language: bool,
+) -> CommandHash {
+    let mut hasher = flags.hasher.clone();
+    hasher.encoded(match (module, needs_language) {
+        (Some(_), true) => b"\0\x01module, -x",
+        (Some(_), false) => b"\0\x01module",
+        (None, _) => b"\0\x01file",
+    });
+    hasher.arg(file);
+    if let Some(module) = module {
+        hasher.arg(module);
+    }
+    hasher.finish()
 }
 
-/// The hash of the compile [`Builder::compile_job`] runs for `paths`, without
-/// putting the command together: `flags`' hash so far plus the arguments that
-/// differ per file, written as [`CommandHasher::encoded`] runs. It must match
-/// [`command_hash`] of the full command, which debug builds check.
-fn compile_hash(flags: &CompileFlags, paths: &FilePaths, needs_language: bool) -> CommandHash {
-    let mut hasher = flags.hasher.clone();
-    if let Some(pcm) = &paths.pcm {
-        hasher
-            .encoded(b"\0-fmodule-output=")
-            .encoded(pcm.path.as_os_str().as_encoded_bytes());
+/// The arguments after a target's shared compile flags, for one file. Colors are
+/// asked for explicitly because the output is captured; printing it strips them
+/// again when they aren't wanted.
+fn compile_suffix<'a>(
+    pcm: Option<&'a Path>,
+    needs_language: bool,
+    depfile: &'a Path,
+    source: &'a Path,
+    object: &'a Path,
+) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(12);
+    if let Some(pcm) = pcm {
+        let mut output = OsString::from("-fmodule-output=");
+        output.push(pcm);
+        args.push(output);
         if needs_language {
-            hasher.encoded(b"\0-x\0c++-module");
+            args.extend(["-x".into(), "c++-module".into()]);
         }
     }
-    hasher
-        .encoded(b"\0-fdiagnostics-color=always\0-MMD\0-MF")
-        .arg(&paths.depfile)
-        .encoded(b"\0-c")
-        .arg(&paths.source.path)
-        .encoded(b"\0-o")
-        .arg(&paths.object.path)
-        .finish()
+    args.extend([
+        "-fdiagnostics-color=always".into(),
+        "-MMD".into(),
+        "-MF".into(),
+        depfile.into(),
+        "-c".into(),
+        source.into(),
+        "-o".into(),
+        object.into(),
+    ]);
+    args
 }
 
 /// `<dir>/<source>.o`.
@@ -2532,6 +2617,29 @@ mod tests {
                 "could not compile `core` (lib)"
             ]
         );
+    }
+
+    #[test]
+    fn each_part_of_a_compile_changes_its_hash() {
+        let flags = |tools: &str| CompileFlags {
+            args: Vec::new(),
+            hasher: CommandHasher::new(tools),
+        };
+        let base = flags("clang++ 23");
+        let hashes = [
+            compile_hash(&base, "src/a.cpp", None, false),
+            compile_hash(&base, "src/b.cpp", None, false),
+            compile_hash(&base, "src/a.cpp", Some("a"), false),
+            compile_hash(&base, "src/a.cpp", Some("a"), true),
+            compile_hash(&base, "src/a.cpp", Some("b"), false),
+            compile_hash(&flags("clang++ 22"), "src/a.cpp", None, false),
+        ];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(hashes[0], compile_hash(&base, "src/a.cpp", None, false));
     }
 
     #[test]

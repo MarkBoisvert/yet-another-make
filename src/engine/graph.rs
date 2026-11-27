@@ -76,10 +76,10 @@ pub fn graph(targets: &[GraphTarget<'_>]) -> Vec<Node> {
             let file = &target.files[step.file];
             let mut needs: Vec<usize> = Vec::new();
             for module in &file.deps.requires {
-                let node = if module == STD_MODULE {
+                let node = if &**module == STD_MODULE {
                     std
                 } else {
-                    providers.get(module.as_str()).copied()
+                    providers.get(&**module).copied()
                 };
                 if let Some(node) = node
                     && !needs.contains(&node)
@@ -128,7 +128,7 @@ pub fn graph(targets: &[GraphTarget<'_>]) -> Vec<Node> {
 mod tests {
     use super::*;
     use crate::engine::plan;
-    use crate::engine::scan::{Deps, Provided};
+    use crate::engine::scan::{Deps, ModuleName, Provided};
     use std::collections::HashSet;
 
     fn file(path: &str, provides: Option<&str>, requires: &[&str]) -> SourceFile {
@@ -139,7 +139,7 @@ mod tests {
                     name: name.into(),
                     is_interface: true,
                 }),
-                requires: requires.iter().map(|r| (*r).to_string()).collect(),
+                requires: requires.iter().map(|r| (*r).into()).collect(),
             },
         }
     }
@@ -152,9 +152,9 @@ mod tests {
             file("b.cppm", Some("b"), &[]),
             file("a.cpp", None, &["a"]),
         ];
-        let lib_plan = plan::plan("lib", &lib_files, &HashSet::<String>::new()).unwrap();
+        let lib_plan = plan::plan("lib", &lib_files, &HashSet::<ModuleName>::new()).unwrap();
         let bin_files = [file("main.cpp", None, &["a", "std"])];
-        let available = HashSet::from(["a".to_string(), "b".to_string()]);
+        let available = HashSet::from([ModuleName::from("a"), ModuleName::from("b")]);
         let bin_plan = plan::plan("bin", &bin_files, &available).unwrap();
         let nodes = graph(&[
             GraphTarget {
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn no_std_node_without_import_std() {
         let files = [file("main.cpp", None, &[])];
-        let plan = plan::plan("bin", &files, &HashSet::<String>::new()).unwrap();
+        let plan = plan::plan("bin", &files, &HashSet::<ModuleName>::new()).unwrap();
         let nodes = graph(&[GraphTarget {
             is_lib: false,
             links_lib: false,
