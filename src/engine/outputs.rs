@@ -23,6 +23,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use rustc_hash::FxHashMap;
+
 use super::state::Record;
 
 /// A hash of an output's whole command, including the tools that run it.
@@ -81,6 +83,16 @@ pub(super) struct Tables<'a> {
     pub entries: &'a HashMap<String, Entry>,
 }
 
+/// What this build knows of a file's contents.
+#[derive(Clone, Copy, Debug, Default)]
+enum Current {
+    #[default]
+    Unchecked,
+    Unreadable,
+    /// Its contents hash id.
+    Hash(u32),
+}
+
 /// The output record, loaded from the last build and updated by this one.
 #[derive(Default)]
 pub struct Outputs {
@@ -90,11 +102,11 @@ pub struct Outputs {
     seen: HashMap<u32, (Stat, u32)>,
     /// By output path.
     entries: HashMap<String, Entry>,
-    path_ids: HashMap<String, u32>,
-    hash_ids: HashMap<[u8; 32], u32>,
-    /// Each file's contents hash id as of this build (`None` if it can't be read),
-    /// so each file is checked once.
-    current: HashMap<u32, Option<u32>>,
+    path_ids: FxHashMap<String, u32>,
+    hash_ids: FxHashMap<[u8; 32], u32>,
+    /// By path id: each file's contents as of this build, so each file is checked
+    /// once.
+    current: Vec<Current>,
     changed: bool,
     /// Records for the journal since it was last written.
     pending: Vec<Record>,
@@ -183,15 +195,24 @@ impl Outputs {
     /// now. Every input is checked (and remembered for [`Self::record`]), even after
     /// one is found changed, so a rebuild records the inputs as they were before it
     /// ran.
-    pub fn is_fresh(&mut self, output: &Path, command: CommandHash, inputs: &[PathBuf]) -> bool {
+    pub fn is_fresh<P: AsRef<Path>>(
+        &mut self,
+        output: &Path,
+        command: CommandHash,
+        inputs: impl IntoIterator<Item = P>,
+    ) -> bool {
         let current: Vec<(u32, Option<u32>)> = inputs
-            .iter()
+            .into_iter()
             .map(|input| {
-                let id = self.path_id(input);
+                let id = self.path_id(input.as_ref());
                 (id, self.current_hash(id))
             })
             .collect();
-        let Some((recorded_command, recorded)) = self.entries.get(&key(output)) else {
+        let recorded = match output.to_str() {
+            Some(text) => self.entries.get(text),
+            None => self.entries.get(&key(output)),
+        };
+        let Some((recorded_command, recorded)) = recorded else {
             return false;
         };
         *recorded_command == command.0
@@ -253,12 +274,27 @@ impl Outputs {
 
     /// Forget what this build knows of `path`, because a step just wrote it.
     pub fn invalidate(&mut self, path: &Path) {
-        if let Some(&id) = self.path_ids.get(&key(path)) {
-            self.current.remove(&id);
+        if let Some(&id) = self.path_ids.get(&key(path))
+            && let Some(slot) = self.current.get_mut(id as usize)
+        {
+            *slot = Current::Unchecked;
         }
     }
 
+    /// A file's contents hash as of this build, or `None` if it can't be read. Like
+    /// staleness, this reuses the recorded hash while the file's stat is unchanged,
+    /// so an unchanged file isn't read.
+    pub fn contents(&mut self, path: &Path) -> Option<blake3::Hash> {
+        let id = self.path_id(path);
+        let hash = self.current_hash(id)?;
+        Some(blake3::Hash::from_bytes(self.hashes[hash as usize]))
+    }
+
     fn path_id(&mut self, path: &Path) -> u32 {
+        // Looked up without allocating; nearly every path is already known.
+        if let Some(&id) = path.to_str().and_then(|text| self.path_ids.get(text)) {
+            return id;
+        }
         let key = key(path);
         if let Some(&id) = self.path_ids.get(&key) {
             return id;
@@ -284,8 +320,10 @@ impl Outputs {
     /// The file's contents hash id now: reused from the last time yam saw it when
     /// its stat is unchanged, otherwise read and hashed.
     fn current_hash(&mut self, id: u32) -> Option<u32> {
-        if let Some(&hash) = self.current.get(&id) {
-            return hash;
+        match self.current.get(id as usize) {
+            Some(Current::Hash(hash)) => return Some(*hash),
+            Some(Current::Unreadable) => return None,
+            Some(Current::Unchecked) | None => {}
         }
         let path = PathBuf::from(&self.paths[id as usize]);
         let hash = Stat::of(&path).and_then(|stat| match self.seen.get(&id) {
@@ -298,12 +336,16 @@ impl Outputs {
                 Some(hash)
             }
         });
-        self.current.insert(id, hash);
+        let slot = id as usize;
+        if self.current.len() <= slot {
+            self.current.resize(slot + 1, Current::Unchecked);
+        }
+        self.current[slot] = hash.map_or(Current::Unreadable, Current::Hash);
         hash
     }
 }
 
-fn index(items: &[String]) -> HashMap<String, u32> {
+fn index(items: &[String]) -> FxHashMap<String, u32> {
     items
         .iter()
         .enumerate()
@@ -407,18 +449,14 @@ mod tests {
         let p = project();
         let mut state = built(&p);
         fs::write(&p.header, "#pragma once\nint x;").unwrap();
-        assert!(
-            !state
-                .outputs
-                .is_fresh(&p.object, command("cc"), &inputs(&p))
-        );
+        assert!(!state.outputs.is_fresh(&p.object, command("cc"), inputs(&p)));
 
         let p = project();
         let mut state = built(&p);
         assert!(
             !state
                 .outputs
-                .is_fresh(&p.object, command("cc -O2"), &inputs(&p))
+                .is_fresh(&p.object, command("cc -O2"), inputs(&p))
         );
         assert!(
             !state
@@ -429,20 +467,12 @@ mod tests {
         let p = project();
         let mut state = built(&p);
         fs::remove_file(&p.object).unwrap();
-        assert!(
-            !state
-                .outputs
-                .is_fresh(&p.object, command("cc"), &inputs(&p))
-        );
+        assert!(!state.outputs.is_fresh(&p.object, command("cc"), inputs(&p)));
 
         let p = project();
         let mut state = built(&p);
         fs::remove_file(&p.header).unwrap();
-        assert!(
-            !state
-                .outputs
-                .is_fresh(&p.object, command("cc"), &inputs(&p))
-        );
+        assert!(!state.outputs.is_fresh(&p.object, command("cc"), inputs(&p)));
     }
 
     #[test]

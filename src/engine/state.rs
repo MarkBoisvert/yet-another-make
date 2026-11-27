@@ -2,8 +2,8 @@
 //! per profile, `target/<Profile>/.yam/state`, plus a journal next to it.
 //!
 //! - **Contents:** the output record ([`Outputs`]), the scan cache ([`ScanCache`]),
-//!   the header record ([`HeaderRecord`]) and the directory listings the source walk
-//!   reuses ([`DirCache`]).
+//!   the header record ([`HeaderRecord`]), the directory listings the source walk
+//!   reuses ([`DirCache`]) and the discovered toolchain ([`toolchain::Cached`]).
 //! - **Layout:** fixed-width little-endian fields. A header (magic, format version,
 //!   yam version), then one table of every string, then one section per record, then
 //!   a blake3 checksum of everything before it. Strings are referred to by index, so
@@ -27,11 +27,12 @@ use super::outputs::{Outputs, Stat};
 use super::scan::{Deps, Provided};
 use super::scan_cache::{Key, ScanCache};
 use crate::manifest::{DirCache, Listing};
+use crate::toolchain::{self, ModuleSource, StdModules, Tool, Toolchain, Version};
 
 const SNAPSHOT_MAGIC: &[u8; 8] = b"YAMSTATE";
 const JOURNAL_MAGIC: &[u8; 8] = b"YAMJOURN";
 /// Bumped whenever the layout of either file changes.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const YAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// How many bytes of a record's blake3 hash the journal keeps as its checksum.
 const RECORD_CHECK: usize = 8;
@@ -75,6 +76,9 @@ pub struct State {
     pub scan: ScanCache,
     pub headers: HeaderRecord,
     pub dirs: DirCache,
+    /// The toolchain the last build discovered; see [`Self::set_toolchain`].
+    toolchain: Option<toolchain::Cached>,
+    toolchain_changed: bool,
     snapshot: PathBuf,
     journal: PathBuf,
     /// The checksum of the snapshot on disk, which the journal names.
@@ -140,6 +144,20 @@ impl State {
         (state, errors)
     }
 
+    /// The toolchain the last build discovered, if any.
+    #[must_use]
+    pub fn toolchain(&self) -> Option<&toolchain::Cached> {
+        self.toolchain.as_ref()
+    }
+
+    /// Replace the cached toolchain, to be saved with the snapshot.
+    pub fn set_toolchain(&mut self, cached: toolchain::Cached) {
+        if self.toolchain.as_ref() != Some(&cached) {
+            self.toolchain = Some(cached);
+            self.toolchain_changed = true;
+        }
+    }
+
     /// Append the results recorded since the last call to the journal, so they
     /// survive if the build is killed.
     ///
@@ -196,12 +214,13 @@ impl State {
             || self.outputs.needs_save()
             || self.scan.needs_save()
             || self.headers.needs_save()
-            || self.dirs.needs_save();
+            || self.dirs.needs_save()
+            || self.toolchain_changed;
         if !changed {
             return Ok(());
         }
         self.headers.prune();
-        let bytes = encode_snapshot(&self.outputs, &self.scan, &self.headers, &self.dirs);
+        let bytes = encode_snapshot(self);
         if let Some(dir) = self.snapshot.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -223,6 +242,7 @@ impl State {
         self.scan.saved();
         self.headers.saved();
         self.dirs.saved();
+        self.toolchain_changed = false;
         Ok(())
     }
 
@@ -231,6 +251,7 @@ impl State {
         self.scan.mark_changed();
         self.headers.mark_changed();
         self.dirs.mark_changed();
+        self.toolchain_changed = true;
     }
 
     fn apply(&mut self, parts: Parts) {
@@ -238,6 +259,7 @@ impl State {
         self.scan = ScanCache::from_entries(parts.scans);
         self.headers = HeaderRecord::from_entries(parts.headers);
         self.dirs = DirCache::from_listings(parts.dirs);
+        self.toolchain = parts.toolchain;
     }
 
     fn replay(&mut self, record: Record) {
@@ -265,6 +287,7 @@ struct Parts {
     scans: HashMap<Key, Deps>,
     headers: HashMap<String, Vec<String>>,
     dirs: HashMap<String, Listing>,
+    toolchain: Option<toolchain::Cached>,
 }
 
 fn checksum(bytes: &[u8]) -> [u8; 32] {
@@ -316,12 +339,8 @@ impl Writer {
     }
 }
 
-fn encode_snapshot(
-    outputs: &Outputs,
-    scan: &ScanCache,
-    headers: &HeaderRecord,
-    dirs: &DirCache,
-) -> Vec<u8> {
+fn encode_snapshot(state: &State) -> Vec<u8> {
+    let (outputs, scan, headers, dirs) = (&state.outputs, &state.scan, &state.headers, &state.dirs);
     let mut w = Writer::default();
 
     let tables = outputs.parts();
@@ -381,6 +400,14 @@ fn encode_snapshot(
         }
     }
 
+    match &state.toolchain {
+        Some(cached) => {
+            w.u8(1);
+            write_toolchain(&mut w, cached);
+        }
+        None => w.u8(0),
+    }
+
     let mut out = Vec::with_capacity(w.body.len() + 64);
     out.extend_from_slice(SNAPSHOT_MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -410,6 +437,37 @@ fn write_deps(w: &mut Writer, deps: &Deps) {
     w.len(deps.requires.len());
     for module in &deps.requires {
         w.str(module);
+    }
+}
+
+fn write_toolchain(w: &mut Writer, cached: &toolchain::Cached) {
+    let path = |w: &mut Writer, path: &Path| w.str(&path.to_string_lossy());
+    let tool = |w: &mut Writer, tool: &Tool| {
+        path(w, &tool.path);
+        w.u32(tool.version.major);
+        w.u32(tool.version.minor);
+        w.u32(tool.version.patch);
+    };
+    let module = |w: &mut Writer, module: &ModuleSource| {
+        path(w, &module.source);
+        w.len(module.system_include_dirs.len());
+        for dir in &module.system_include_dirs {
+            path(w, dir);
+        }
+    };
+    let toolchain = &cached.toolchain;
+    w.hash(&cached.fingerprint);
+    tool(w, &toolchain.cxx);
+    tool(w, &toolchain.scan_deps);
+    path(w, &toolchain.ar);
+    path(w, &toolchain.std_modules.manifest);
+    module(w, &toolchain.std_modules.std);
+    match &toolchain.std_modules.std_compat {
+        Some(compat) => {
+            w.u8(1);
+            module(w, compat);
+        }
+        None => w.u8(0),
     }
 }
 
@@ -581,6 +639,58 @@ impl<'a> Body<'a> {
             .collect::<Option<Vec<_>>>()?;
         Some(Deps { provides, requires })
     }
+
+    fn path(&mut self) -> Option<PathBuf> {
+        self.str().map(PathBuf::from)
+    }
+
+    fn tool(&mut self) -> Option<Tool> {
+        Some(Tool {
+            path: self.path()?,
+            version: Version {
+                major: self.reader.u32()?,
+                minor: self.reader.u32()?,
+                patch: self.reader.u32()?,
+            },
+        })
+    }
+
+    fn module(&mut self) -> Option<ModuleSource> {
+        let source = self.path()?;
+        let count = self.reader.len()?;
+        let system_include_dirs = (0..count).map(|_| self.path()).collect::<Option<_>>()?;
+        Some(ModuleSource {
+            source,
+            system_include_dirs,
+        })
+    }
+
+    fn toolchain(&mut self) -> Option<toolchain::Cached> {
+        let fingerprint = self.reader.hash()?;
+        let cxx = self.tool()?;
+        let scan_deps = self.tool()?;
+        let ar = self.path()?;
+        let manifest = self.path()?;
+        let std = self.module()?;
+        let std_compat = match self.reader.u8()? {
+            0 => None,
+            1 => Some(self.module()?),
+            _ => return None,
+        };
+        Some(toolchain::Cached {
+            fingerprint,
+            toolchain: Toolchain {
+                cxx,
+                scan_deps,
+                ar,
+                std_modules: StdModules {
+                    manifest,
+                    std,
+                    std_compat,
+                },
+            },
+        })
+    }
 }
 
 /// Check the magic, version and yam version at the start of a file.
@@ -667,6 +777,12 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(Parts, [u8; 32])> {
         dirs.insert(dir, Listing { mtime, entries });
     }
 
+    let toolchain = match b.reader.u8()? {
+        0 => None,
+        1 => Some(b.toolchain()?),
+        _ => return None,
+    };
+
     b.reader.done().then_some(())?;
     Some((
         Parts {
@@ -674,6 +790,7 @@ fn decode_snapshot(bytes: &[u8]) -> Option<(Parts, [u8; 32])> {
             scans,
             headers,
             dirs,
+            toolchain,
         },
         id,
     ))
@@ -810,6 +927,34 @@ mod tests {
         }
     }
 
+    fn cached_toolchain() -> toolchain::Cached {
+        let tool = |path: &str| Tool {
+            path: path.into(),
+            version: Version {
+                major: 22,
+                minor: 1,
+                patch: 8,
+            },
+        };
+        let module = |source: &str| ModuleSource {
+            source: source.into(),
+            system_include_dirs: vec!["/llvm/share/libc++/v1".into()],
+        };
+        toolchain::Cached {
+            fingerprint: [9; 32],
+            toolchain: Toolchain {
+                cxx: tool("/llvm/bin/clang++"),
+                scan_deps: tool("/llvm/bin/clang-scan-deps"),
+                ar: "/llvm/bin/llvm-ar".into(),
+                std_modules: StdModules {
+                    manifest: "/llvm/lib/libc++.modules.json".into(),
+                    std: module("/llvm/share/libc++/v1/std.cppm"),
+                    std_compat: Some(module("/llvm/share/libc++/v1/std.compat.cppm")),
+                },
+            },
+        }
+    }
+
     /// One of everything the state holds.
     fn fill(p: &Project, state: &mut State) {
         let inputs = [p.path("a.cpp")];
@@ -820,6 +965,7 @@ mod tests {
             &p.path("a.o"),
             vec!["src/a.hpp".into(), "include/b.hpp".into()],
         );
+        state.set_toolchain(cached_toolchain());
         let mut tree_cache = std::mem::take(&mut state.dirs);
         crate::manifest::SourceTree::scan_cached(p.dir.path(), &mut tree_cache).unwrap();
         state.dirs = tree_cache;
@@ -836,6 +982,7 @@ mod tests {
             state.headers.get(&p.path("a.o")),
             ["src/a.hpp", "include/b.hpp"]
         );
+        assert_eq!(state.toolchain(), Some(&cached_toolchain()));
         // The loaded listings serve the next walk.
         assert!(state.dirs.needs_save(), "loaded listings wait to be used");
         let tree = crate::manifest::SourceTree::scan_cached(p.dir.path(), &mut state.dirs).unwrap();
@@ -856,6 +1003,24 @@ mod tests {
         let (mut state, errors) = p.load();
         assert!(errors.is_empty(), "{errors:?}");
         assert_filled(&p, &mut state);
+    }
+
+    #[test]
+    fn only_a_different_toolchain_needs_saving() {
+        let p = Project::new();
+        let (mut state, _) = p.load();
+        state.set_toolchain(cached_toolchain());
+        state.save().unwrap();
+
+        let (mut state, _) = p.load();
+        state.set_toolchain(cached_toolchain());
+        assert!(!state.toolchain_changed);
+        let mut other = cached_toolchain();
+        other.fingerprint = [8; 32];
+        state.set_toolchain(other.clone());
+        assert!(state.toolchain_changed);
+        state.save().unwrap();
+        assert_eq!(p.load().0.toolchain(), Some(&other));
     }
 
     #[test]
