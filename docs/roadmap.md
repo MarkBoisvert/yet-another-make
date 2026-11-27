@@ -309,7 +309,7 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
         `include-dirs`.
       - A bin that links the project library also links the library's `links`.
     - Expand globs with `globset` and one directory walk per build, shared with
-      validation. Caching the listings moves to the state file (#26).
+      validation. The listings are cached in the state file since #26.
     - Order each target's module interfaces by their imports, read from the files'
       text. This is a stopgap until #21; every file is compiled on every build until
       #24, one at a time until #25.
@@ -328,8 +328,7 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
 22. **Persistent scan cache** (engine, perf)
     - Keyed on `blake3(content)` plus a flags hash.
     - Only new or changed files are rescanned; a no-op build performs **zero** scans.
-    - Stored in `target/<Profile>/.yam/`: `scan-cache.json` until the state file
-      (#26) takes it over.
+    - Stored in the build state file since #26 (`scan-cache.json` before that).
     - The flags hash covers the scanner and compiler (path and version) and the
       file's scan flags (standard, profile flags, include directories), not its path.
     - Each build keeps only the entries it used; a no-op build doesn't rewrite the
@@ -339,7 +338,7 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Compile with `-MMD -MF`: project headers only. Toolchain headers change only
       with the toolchain, which every key already covers by path and version.
     - Ingest depfiles into the state file after each compile, the way `.ninja_deps`
-      works. Until #26 that's `target/<Profile>/.yam/headers.json`.
+      works. Kept in the build state file since #26.
     - The scan cache key includes the recorded headers' contents, so a header change
       that affects imports rescans the files that include it.
 24. **Build graph + staleness** (engine)
@@ -350,7 +349,7 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
       (transitively), and for archives and links their objects and libraries.
     - Restat by contents: a byte-identical `.pcm`, object or archive leaves what
       depends on it fresh. (Rare in Debug: DWARF 5 embeds source checksums.)
-    - Until #26 the record is `target/<Profile>/.yam/outputs.json`.
+    - The record is kept in the build state file since #26.
     - Cycles are reported with the module chain, e.g. `a` → `b` → `a`.
 25. **Parallel scheduler** (engine, perf)
     - Topological execution, `-j` defaulting to the number of CPUs.
@@ -365,6 +364,10 @@ Acceptance criteria quote the C++ prototype's behavior, which becomes the first 
     - Versioned header; a corrupt file triggers a rebuild, not a crash.
     - Caches directory listings and their mtimes for glob expansion (from #20), so
       no-op builds don't re-walk unchanged trees.
+    - Hand-rolled binary format, chosen by measurement (11 ms to load at 10k-unit
+      scale, against 45 ms for `postcard` and 87 ms for JSON).
+    - Replaces #22–#24's JSON files. A journal written as jobs finish keeps a killed
+      build's progress.
 27. **Startup & stat hot-path profiling** (perf)
     - Profile no-op builds with `perf` and `cargo flamegraph`.
     - Remove allocations from the per-file check loop; parallelize `stat` calls if it

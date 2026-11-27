@@ -22,8 +22,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::cli::BuildArgs;
 use crate::engine::{
-    self, Action, CommandHash, Deps, FlagsHash, GraphTarget, HeaderRecord, Key, Outputs, Plan,
-    STD_MODULE, ScanCache, ScanJob, SourceFile,
+    self, Action, CommandHash, Deps, FlagsHash, GraphTarget, Key, Plan, STD_MODULE, ScanJob,
+    SourceFile, State,
 };
 use crate::manifest::{
     self, CppStd, GlobList, Manifest, SourceTree, Target, TargetKind, has_errors, is_link_path,
@@ -85,7 +85,14 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to resolve `{}`", args.path.display()))?;
     let manifest = Manifest::load(&root)?;
-    let tree = SourceTree::scan(&root)?;
+    let profile = if args.release {
+        Profile::Release
+    } else {
+        Profile::Debug
+    };
+    let out = root.join("target").join(profile.dir_name());
+    let mut caches = Caches::load(&out);
+    let tree = SourceTree::scan_cached(&root, &mut caches.state.dirs)?;
     let diagnostics = validate_tree(&manifest, &root, &tree)?;
     report(&diagnostics);
     if has_errors(&diagnostics) {
@@ -103,12 +110,6 @@ pub fn run(args: &BuildArgs) -> Result<()> {
 
     let targets = select(resolve_targets(&manifest, &root)?, args)?;
     let selected = select_files(&root, &targets, &tree)?;
-
-    let profile = if args.release {
-        Profile::Release
-    } else {
-        Profile::Debug
-    };
     let toolchain = Toolchain::discover()?;
 
     style::status(
@@ -120,7 +121,6 @@ pub fn run(args: &BuildArgs) -> Result<()> {
             root.display()
         ),
     );
-    let out = root.join("target").join(profile.dir_name());
     let builder = Builder {
         root: &root,
         project: &manifest.project.name,
@@ -133,7 +133,7 @@ pub fn run(args: &BuildArgs) -> Result<()> {
             |jobs| jobs as usize,
         ),
         keep_going: args.keep_going,
-        caches: RefCell::new(Caches::load(&out)),
+        caches: RefCell::new(caches),
         out,
     };
     // Whatever the build got through is kept, even when a step fails.
@@ -162,6 +162,7 @@ pub fn run(args: &BuildArgs) -> Result<()> {
 /// failed one still runs, and every failure is reported.
 fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
     let prepared = builder.prepare(selected)?;
+    builder.caches.borrow_mut().flush();
     let graph_targets: Vec<GraphTarget<'_>> = prepared
         .iter()
         .map(|p| GraphTarget {
@@ -237,6 +238,7 @@ fn build(builder: &Builder<'_>, selected: Vec<Selected<'_>>) -> Result<()> {
         match result {
             Ok(was_compile) => {
                 ran += usize::from(was_compile);
+                builder.caches.borrow_mut().flush();
                 progress.done(node);
             }
             Err(err) => {
@@ -466,42 +468,45 @@ fn print_output(output: &[(Vec<u8>, Vec<u8>)]) {
     }
 }
 
-/// What one build hands the next: scan results and the headers each object was
-/// compiled with. Loaded once, and saved at the end even if the build fails.
+/// What one build hands the next, in the build state file, plus what this build
+/// learns along the way. Loaded before the source walk; saved at the end even if the
+/// build fails, and journaled as jobs finish, so a killed build keeps its progress.
 struct Caches {
-    scan: ScanCache,
-    headers: HeaderRecord,
-    outputs: Outputs,
+    state: State,
     /// Header contents hashes for this build, so each header is read once.
     header_hashes: HashMap<PathBuf, Option<blake3::Hash>>,
+    /// Whether writing the journal already failed, so that's reported once.
+    journal_failed: bool,
 }
 
 impl Caches {
     fn load(out: &Path) -> Self {
-        let dir = out.join(".yam");
-        let (scan, discarded) = ScanCache::load(&dir.join("scan-cache.json"));
-        if let Some(reason) = discarded {
-            style::note(format!("{reason}; scanning every file again"));
-        }
-        let (headers, discarded) = HeaderRecord::load(&dir.join("headers.json"));
-        if let Some(reason) = discarded {
-            style::note(format!("{reason}; header dependencies start over"));
-        }
-        let (outputs, discarded) = Outputs::load(&dir.join("outputs.json"));
-        if let Some(reason) = discarded {
+        let (state, errors) = State::load(&out.join(".yam"));
+        for reason in errors {
             style::note(format!("{reason}; building everything again"));
         }
         Self {
-            scan,
-            headers,
-            outputs,
+            state,
             header_hashes: HashMap::new(),
+            journal_failed: false,
+        }
+    }
+
+    /// Append what finished since the last call to the journal.
+    fn flush(&mut self) {
+        if let Err(err) = self.state.flush()
+            && !self.journal_failed
+        {
+            self.journal_failed = true;
+            style::warning(format!(
+                "couldn't write the build journal: {err}; an interrupted build will redo its work"
+            ));
         }
     }
 
     /// The scan key for a file, using the headers `object` was last compiled with.
     fn key(&mut self, root: &Path, file: &FileKey, object: &Path) -> Key {
-        let headers = self.headers.get(object).to_vec();
+        let headers = self.state.headers.get(object).to_vec();
         self.key_with(root, file, &headers)
     }
 
@@ -522,14 +527,8 @@ impl Caches {
     }
 
     fn save(&mut self) {
-        if let Err(err) = self.scan.save_if_changed() {
-            style::warning(format!("couldn't save the scan cache: {err}"));
-        }
-        if let Err(err) = self.headers.save_if_changed() {
-            style::warning(format!("couldn't save the header record: {err}"));
-        }
-        if let Err(err) = self.outputs.save_if_changed() {
-            style::warning(format!("couldn't save the output record: {err}"));
+        if let Err(err) = self.state.save() {
+            style::warning(format!("couldn't save the build state: {err}"));
         }
     }
 }
@@ -816,10 +815,10 @@ impl Builder<'_> {
                 let headers = self.record_headers(&prepared[target], file, &object, &depfile);
                 let inputs = self.compile_inputs(&source, &headers, &pcms);
                 let mut caches = self.caches.borrow_mut();
-                caches.outputs.record(&object, command, &inputs);
-                caches.outputs.invalidate(&object);
+                caches.state.outputs.record(&object, command, &inputs);
+                caches.state.outputs.invalidate(&object);
                 if let Some(pcm) = &pcm {
-                    caches.outputs.invalidate(pcm);
+                    caches.state.outputs.invalidate(pcm);
                 }
                 Ok(true)
             }
@@ -829,8 +828,8 @@ impl Builder<'_> {
                 inputs,
             } => {
                 let mut caches = self.caches.borrow_mut();
-                caches.outputs.record(&output, command, &inputs);
-                caches.outputs.invalidate(&output);
+                caches.state.outputs.record(&output, command, &inputs);
+                caches.state.outputs.invalidate(&output);
                 Ok(false)
             }
         }
@@ -928,7 +927,7 @@ impl Builder<'_> {
                 };
                 let output = object_file(&obj_dir, file);
                 let key = caches.key(self.root, &file_key, &output);
-                if let Some(deps) = caches.scan.get(key) {
+                if let Some(deps) = caches.state.scan.get(key) {
                     results.push((Some(deps), file_key));
                     continue;
                 }
@@ -968,7 +967,7 @@ impl Builder<'_> {
             let database = self.out.join("scan").join("compile_commands.json");
             let fresh = engine::scan(&toolchain.scan_deps.path, &database, &jobs, self.verbose)?;
             for ((index, key), deps) in misses.into_iter().zip(fresh) {
-                caches.scan.insert(key, deps.clone());
+                caches.state.scan.insert(key, deps.clone());
                 results[index].0 = Some(deps);
             }
         }
@@ -1092,11 +1091,12 @@ impl Builder<'_> {
             .arg(&object);
         let command = command_hash(&self.tools(), &compile);
 
-        let headers = self.caches.borrow().headers.get(&object).to_vec();
+        let headers = self.caches.borrow().state.headers.get(&object).to_vec();
         let inputs = self.compile_inputs(&source, &headers, pcms);
         let fresh = self
             .caches
             .borrow_mut()
+            .state
             .outputs
             .is_fresh(&object, command, &inputs);
         if fresh && pcm.as_ref().is_none_or(|pcm| pcm.exists()) {
@@ -1147,8 +1147,11 @@ impl Builder<'_> {
         let headers = engine::headers_from_depfile(deps, self.root, &source);
         let mut caches = self.caches.borrow_mut();
         let key = caches.key_with(self.root, &prepared.keys[file], &headers);
-        caches.scan.insert(key, prepared.files[file].deps.clone());
-        caches.headers.record(object, headers.clone());
+        caches
+            .state
+            .scan
+            .insert(key, prepared.files[file].deps.clone());
+        caches.state.headers.record(object, headers.clone());
         headers
     }
 
@@ -1193,6 +1196,7 @@ impl Builder<'_> {
         if self
             .caches
             .borrow_mut()
+            .state
             .outputs
             .is_fresh(&archive, command, &objects)
         {
@@ -1278,6 +1282,7 @@ impl Builder<'_> {
         if self
             .caches
             .borrow_mut()
+            .state
             .outputs
             .is_fresh(&executable, command, &inputs)
         {
@@ -1501,6 +1506,29 @@ mod tests {
         Some(entries.len())
     }
 
+    /// Age the project's directories by an hour and build once, so the directory
+    /// cache trusts their listings: it doesn't trust a directory changed within the
+    /// last two seconds. Directories can't be given an mtime this way on Windows,
+    /// where these tests have no toolchain anyway.
+    fn settle(dir: &Path) {
+        #[cfg(unix)]
+        {
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            for entry in walkdir::WalkDir::new(dir)
+                .into_iter()
+                .filter_entry(|e| e.file_name() != "target")
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_dir())
+            {
+                fs::File::open(entry.path())
+                    .and_then(|file| file.set_modified(old))
+                    .unwrap();
+            }
+        }
+        run(&build_args(dir)).unwrap();
+        let _ = scanned(dir);
+    }
+
     #[test]
     fn unchanged_files_are_never_rescanned() {
         if !have_toolchain() {
@@ -1513,13 +1541,16 @@ mod tests {
             &dir.join("src/main.cpp"),
             "import std;\nimport cached;\n\nint main() {\n    std::println(\"{}\", cached::add(1, 2));\n}\n",
         );
-        let cache = dir.join("target/Debug/.yam/scan-cache.json");
+        let cache = dir.join("target/Debug/.yam/state");
 
         run(&build_args(&dir)).unwrap();
         assert_eq!(scanned(&dir), Some(2));
+        // The first build created `target/`, so the next one records the root's new
+        // listing once; after that a no-op build changes nothing.
+        settle(&dir);
         let saved = fs::metadata(&cache).unwrap().modified().unwrap();
 
-        // A no-op build scans nothing and leaves the cache file alone.
+        // A no-op build scans nothing and leaves the state file alone.
         run(&build_args(&dir)).unwrap();
         assert_eq!(scanned(&dir), None);
         assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), saved);
@@ -1540,10 +1571,10 @@ mod tests {
         let mut release = build_args(&dir);
         release.release = true;
         run(&release).unwrap();
-        assert!(dir.join("target/Release/.yam/scan-cache.json").is_file());
+        assert!(dir.join("target/Release/.yam/state").is_file());
 
         // A corrupt cache is discarded, and everything is scanned again.
-        fs::write(&cache, "not json").unwrap();
+        fs::write(&cache, "not a state file").unwrap();
         run(&build_args(&dir)).unwrap();
         assert_eq!(scanned(&dir), Some(2));
     }
@@ -1565,12 +1596,12 @@ mod tests {
         assert_eq!(scanned(&dir), Some(1));
         assert_eq!(run_binary(&exe(&dir, "Debug", "flag")), "plain\n");
         assert!(!dir.join("target/Debug/std").exists());
-        let record = fs::read_to_string(dir.join("target/Debug/.yam/headers.json")).unwrap();
-        assert!(record.contains("src/config.h"), "{record}");
-        assert!(
-            !record.contains("c++/v1"),
-            "toolchain headers aren't recorded: {record}"
-        );
+        // The state file stores strings as plain UTF-8, so the recorded headers can be
+        // looked for in its bytes.
+        let state = fs::read(dir.join("target/Debug/.yam/state")).unwrap();
+        let has = |needle: &str| state.windows(needle.len()).any(|w| w == needle.as_bytes());
+        assert!(has("src/config.h"), "the header isn't recorded");
+        assert!(!has("c++/v1"), "toolchain headers aren't recorded");
 
         // The source didn't change, but its header did, so it's scanned again and
         // now needs `std.pcm`.

@@ -14,23 +14,16 @@
 //! `restat` for free: a recompiled interface whose `.pcm` comes out byte-identical
 //! leaves its importers fresh.
 //!
-//! The record lives in `target/<Profile>/.yam/outputs.json` until the binary build
-//! state file (#26) takes it over. Paths and hashes are interned, so each input of
-//! each output is two small numbers.
+//! The record is part of the build state file ([`super::State`]). Paths and hashes
+//! are interned, so each input of each output is two small numbers.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use serde::{Deserialize, Serialize};
-
-use super::store::{self, StoreError};
-
-/// Bumped whenever the file layout changes.
-const FORMAT_VERSION: u32 = 1;
+use super::state::Record;
 
 /// A hash of an output's whole command, including the tools that run it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,10 +46,10 @@ impl CommandHash {
 }
 
 /// A file's mtime (nanoseconds since the epoch) and size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Stat {
-    mtime: u64,
-    size: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub mtime: u64,
+    pub size: u64,
 }
 
 impl Stat {
@@ -75,67 +68,115 @@ impl Stat {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Entry {
-    /// The command hash, as hex.
-    command: String,
-    /// `(path id, hash id)` per input.
-    inputs: Vec<(u32, u32)>,
-}
+/// An output's command hash and `(path id, hash id)` per input.
+pub(super) type Entry = ([u8; 32], Vec<(u32, u32)>);
 
-/// What yam last saw of a file: its stat and contents hash.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Seen {
-    stat: Stat,
-    hash: u32,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct Data {
-    paths: Vec<String>,
-    /// Contents hashes as hex.
-    hashes: Vec<String>,
-    /// By path id.
-    seen: HashMap<u32, Seen>,
+/// The record's tables, as the state file writes them.
+pub(super) struct Tables<'a> {
+    pub paths: &'a [String],
+    pub hashes: &'a [[u8; 32]],
+    /// By path id: the stat and contents hash id yam last saw.
+    pub seen: &'a HashMap<u32, (Stat, u32)>,
     /// By output path.
-    outputs: HashMap<String, Entry>,
+    pub entries: &'a HashMap<String, Entry>,
 }
 
 /// The output record, loaded from the last build and updated by this one.
 #[derive(Default)]
 pub struct Outputs {
-    path: PathBuf,
-    data: Data,
+    paths: Vec<String>,
+    hashes: Vec<[u8; 32]>,
+    /// What yam last saw of each file, by path id: its stat and contents hash id.
+    seen: HashMap<u32, (Stat, u32)>,
+    /// By output path.
+    entries: HashMap<String, Entry>,
     path_ids: HashMap<String, u32>,
-    hash_ids: HashMap<String, u32>,
+    hash_ids: HashMap<[u8; 32], u32>,
     /// Each file's contents hash id as of this build (`None` if it can't be read),
     /// so each file is checked once.
     current: HashMap<u32, Option<u32>>,
     changed: bool,
+    /// Records for the journal since it was last written.
+    pending: Vec<Record>,
 }
 
 impl Outputs {
-    /// Load the record at `path`. A missing file is an empty record; an unreadable,
-    /// corrupt or outdated one is also empty, with the reason returned.
-    #[must_use]
-    pub fn load(path: &Path) -> (Self, Option<StoreError>) {
-        let mut outputs = Self {
-            path: path.to_path_buf(),
+    /// A record from its tables, as the state file stores them. `None` if an id is
+    /// out of range.
+    pub(super) fn from_parts(
+        paths: Vec<String>,
+        hashes: Vec<[u8; 32]>,
+        seen: HashMap<u32, (Stat, u32)>,
+        entries: HashMap<String, Entry>,
+    ) -> Option<Self> {
+        let path_ok = |id: u32| (id as usize) < paths.len();
+        let hash_ok = |id: u32| (id as usize) < hashes.len();
+        let valid = seen.iter().all(|(&p, &(_, h))| path_ok(p) && hash_ok(h))
+            && entries
+                .values()
+                .all(|(_, inputs)| inputs.iter().all(|&(p, h)| path_ok(p) && hash_ok(h)));
+        if !valid {
+            return None;
+        }
+        Some(Self {
+            path_ids: index(&paths),
+            hash_ids: hashes
+                .iter()
+                .enumerate()
+                .map(|(i, hash)| (*hash, u32::try_from(i).unwrap_or(u32::MAX)))
+                .collect(),
+            paths,
+            hashes,
+            seen,
+            entries,
             ..Self::default()
-        };
-        let error = match store::load::<Data>(path, FORMAT_VERSION) {
-            Ok(data) => {
-                outputs.data = data.unwrap_or_default();
-                None
+        })
+    }
+
+    /// The tables, for the state file.
+    pub(super) fn parts(&self) -> Tables<'_> {
+        Tables {
+            paths: &self.paths,
+            hashes: &self.hashes,
+            seen: &self.seen,
+            entries: &self.entries,
+        }
+    }
+
+    pub(super) fn needs_save(&self) -> bool {
+        self.changed
+    }
+
+    pub(super) fn saved(&mut self) {
+        self.changed = false;
+    }
+
+    pub(super) fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
+    pub(super) fn take_pending(&mut self) -> Vec<Record> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Apply a journal record: `output` was built by `command` from `inputs`.
+    pub(super) fn replay(
+        &mut self,
+        output: &str,
+        command: [u8; 32],
+        inputs: &[(String, [u8; 32], Option<Stat>)],
+    ) {
+        let mut recorded = Vec::with_capacity(inputs.len());
+        for (path, hash, stat) in inputs {
+            let path = self.path_id(Path::new(path));
+            let hash = self.hash_id(hash);
+            if let Some(stat) = stat {
+                self.seen.insert(path, (*stat, hash));
             }
-            Err(err) => {
-                outputs.changed = true;
-                Some(err)
-            }
-        };
-        outputs.path_ids = index(&outputs.data.paths);
-        outputs.hash_ids = index(&outputs.data.hashes);
-        (outputs, error)
+            recorded.push((path, hash));
+        }
+        self.entries.insert(output.to_string(), (command, recorded));
+        self.changed = true;
     }
 
     /// Whether `output` exists and was built by `command` from `inputs` as they are
@@ -150,13 +191,12 @@ impl Outputs {
                 (id, self.current_hash(id))
             })
             .collect();
-        let Some(entry) = self.data.outputs.get(&key(output)) else {
+        let Some((recorded_command, recorded)) = self.entries.get(&key(output)) else {
             return false;
         };
-        entry.command == hex(&command.0)
-            && entry.inputs.len() == current.len()
-            && entry
-                .inputs
+        *recorded_command == command.0
+            && recorded.len() == current.len()
+            && recorded
                 .iter()
                 .zip(&current)
                 .all(|(&(path, hash), &(now_path, now_hash))| {
@@ -178,17 +218,37 @@ impl Outputs {
                 None => complete = false,
             }
         }
-        let entry = Entry {
-            command: hex(&command.0),
-            inputs: recorded,
-        };
         let key = key(output);
         if !complete {
-            self.changed |= self.data.outputs.remove(&key).is_some();
-        } else if self.data.outputs.get(&key) != Some(&entry) {
-            self.data.outputs.insert(key, entry);
-            self.changed = true;
+            self.changed |= self.entries.remove(&key).is_some();
+            return;
         }
+        let entry = (command.0, recorded);
+        if self.entries.get(&key) == Some(&entry) {
+            return;
+        }
+        self.pending.push(Record::Output {
+            output: key.clone(),
+            command: command.0,
+            inputs: entry
+                .1
+                .iter()
+                .map(|&(path, hash)| {
+                    let stat = self
+                        .seen
+                        .get(&path)
+                        .filter(|(_, seen)| *seen == hash)
+                        .map(|(stat, _)| *stat);
+                    (
+                        self.paths[path as usize].clone(),
+                        self.hashes[hash as usize],
+                        stat,
+                    )
+                })
+                .collect(),
+        });
+        self.entries.insert(key, entry);
+        self.changed = true;
     }
 
     /// Forget what this build knows of `path`, because a step just wrote it.
@@ -198,39 +258,25 @@ impl Outputs {
         }
     }
 
-    /// Write the record if anything changed, so a no-op build writes nothing.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the file can't be written.
-    pub fn save_if_changed(&mut self) -> io::Result<()> {
-        if self.changed {
-            store::save(&self.path, FORMAT_VERSION, &self.data)?;
-            self.changed = false;
-        }
-        Ok(())
-    }
-
     fn path_id(&mut self, path: &Path) -> u32 {
         let key = key(path);
         if let Some(&id) = self.path_ids.get(&key) {
             return id;
         }
-        let id = u32::try_from(self.data.paths.len()).unwrap_or(u32::MAX);
-        self.data.paths.push(key.clone());
+        let id = u32::try_from(self.paths.len()).unwrap_or(u32::MAX);
+        self.paths.push(key.clone());
         self.path_ids.insert(key, id);
         self.changed = true;
         id
     }
 
-    fn hash_id(&mut self, hash: &blake3::Hash) -> u32 {
-        let hex = hash.to_hex().to_string();
-        if let Some(&id) = self.hash_ids.get(&hex) {
+    fn hash_id(&mut self, hash: &[u8; 32]) -> u32 {
+        if let Some(&id) = self.hash_ids.get(hash) {
             return id;
         }
-        let id = u32::try_from(self.data.hashes.len()).unwrap_or(u32::MAX);
-        self.data.hashes.push(hex.clone());
-        self.hash_ids.insert(hex, id);
+        let id = u32::try_from(self.hashes.len()).unwrap_or(u32::MAX);
+        self.hashes.push(*hash);
+        self.hash_ids.insert(*hash, id);
         self.changed = true;
         id
     }
@@ -241,13 +287,13 @@ impl Outputs {
         if let Some(&hash) = self.current.get(&id) {
             return hash;
         }
-        let path = PathBuf::from(&self.data.paths[id as usize]);
-        let hash = Stat::of(&path).and_then(|stat| match self.data.seen.get(&id) {
-            Some(seen) if seen.stat == stat => Some(seen.hash),
+        let path = PathBuf::from(&self.paths[id as usize]);
+        let hash = Stat::of(&path).and_then(|stat| match self.seen.get(&id) {
+            Some(&(seen, hash)) if seen == stat => Some(hash),
             _ => {
                 let bytes = fs::read(&path).ok()?;
-                let hash = self.hash_id(&blake3::hash(&bytes));
-                self.data.seen.insert(id, Seen { stat, hash });
+                let hash = self.hash_id(blake3::hash(&bytes).as_bytes());
+                self.seen.insert(id, (stat, hash));
                 self.changed = true;
                 Some(hash)
             }
@@ -269,13 +315,10 @@ fn key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
-    blake3::Hash::from_bytes(*bytes).to_hex().to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::state::State;
     use std::time::{Duration, SystemTime};
 
     fn command(text: &str) -> CommandHash {
@@ -290,11 +333,22 @@ mod tests {
     }
 
     struct Project {
-        _dir: tempfile::TempDir,
-        record: PathBuf,
+        dir: tempfile::TempDir,
         source: PathBuf,
         header: PathBuf,
         object: PathBuf,
+    }
+
+    impl Project {
+        fn state_dir(&self) -> PathBuf {
+            self.dir.path().join(".yam")
+        }
+
+        fn load(&self) -> State {
+            let (state, errors) = State::load(&self.state_dir());
+            assert!(errors.is_empty(), "{errors:?}");
+            state
+        }
     }
 
     fn project() -> Project {
@@ -306,85 +360,106 @@ mod tests {
         set_mtime(&path("a.cpp"), 1_000);
         set_mtime(&path("a.h"), 1_000);
         Project {
-            record: path(".yam/outputs.json"),
             source: path("a.cpp"),
             header: path("a.h"),
             object: path("a.o"),
-            _dir: dir,
+            dir,
         }
     }
 
-    /// Build once, then load the saved record as the next build would.
-    fn built(p: &Project) -> Outputs {
+    /// Build once, then load the saved state as the next build would.
+    fn built(p: &Project) -> State {
         let inputs = [p.source.clone(), p.header.clone()];
-        let (mut outputs, error) = Outputs::load(&p.record);
-        assert!(error.is_none());
-        assert!(!outputs.is_fresh(&p.object, command("cc"), &inputs));
-        outputs.record(&p.object, command("cc"), &inputs);
-        outputs.save_if_changed().unwrap();
-        Outputs::load(&p.record).0
+        let mut state = p.load();
+        assert!(!state.outputs.is_fresh(&p.object, command("cc"), &inputs));
+        state.outputs.record(&p.object, command("cc"), &inputs);
+        state.save().unwrap();
+        p.load()
     }
 
     #[test]
     fn an_unchanged_output_is_fresh_and_writes_nothing() {
         let p = project();
-        let mut outputs = built(&p);
+        let mut state = built(&p);
         let inputs = [p.source.clone(), p.header.clone()];
-        assert!(outputs.is_fresh(&p.object, command("cc"), &inputs));
-        fs::remove_file(&p.record).unwrap();
-        outputs.save_if_changed().unwrap();
-        assert!(!p.record.exists(), "a no-op build rewrote the record");
+        assert!(state.outputs.is_fresh(&p.object, command("cc"), &inputs));
+        fs::remove_file(p.state_dir().join("state")).unwrap();
+        state.save().unwrap();
+        assert!(
+            !p.state_dir().join("state").exists(),
+            "a no-op build rewrote it"
+        );
     }
 
     #[test]
     fn a_new_mtime_with_the_same_contents_is_fresh() {
         let p = project();
-        let mut outputs = built(&p);
+        let mut state = built(&p);
         set_mtime(&p.header, 2_000);
         let inputs = [p.source.clone(), p.header.clone()];
-        assert!(outputs.is_fresh(&p.object, command("cc"), &inputs));
+        assert!(state.outputs.is_fresh(&p.object, command("cc"), &inputs));
     }
 
     #[test]
     fn changed_contents_commands_inputs_or_outputs_are_stale() {
-        let p = project();
-        let inputs = [p.source.clone(), p.header.clone()];
+        let inputs = |p: &Project| [p.source.clone(), p.header.clone()];
 
-        let mut outputs = built(&p);
+        let p = project();
+        let mut state = built(&p);
         fs::write(&p.header, "#pragma once\nint x;").unwrap();
-        assert!(!outputs.is_fresh(&p.object, command("cc"), &inputs));
+        assert!(
+            !state
+                .outputs
+                .is_fresh(&p.object, command("cc"), &inputs(&p))
+        );
 
         let p = project();
-        let mut outputs = built(&p);
-        assert!(!outputs.is_fresh(&p.object, command("cc -O2"), &inputs));
-        assert!(!outputs.is_fresh(&p.object, command("cc"), &inputs[..1]));
+        let mut state = built(&p);
+        assert!(
+            !state
+                .outputs
+                .is_fresh(&p.object, command("cc -O2"), &inputs(&p))
+        );
+        assert!(
+            !state
+                .outputs
+                .is_fresh(&p.object, command("cc"), &inputs(&p)[..1])
+        );
 
         let p = project();
-        let mut outputs = built(&p);
+        let mut state = built(&p);
         fs::remove_file(&p.object).unwrap();
-        assert!(!outputs.is_fresh(&p.object, command("cc"), &inputs));
+        assert!(
+            !state
+                .outputs
+                .is_fresh(&p.object, command("cc"), &inputs(&p))
+        );
 
         let p = project();
-        let mut outputs = built(&p);
+        let mut state = built(&p);
         fs::remove_file(&p.header).unwrap();
-        assert!(!outputs.is_fresh(&p.object, command("cc"), &inputs));
+        assert!(
+            !state
+                .outputs
+                .is_fresh(&p.object, command("cc"), &inputs(&p))
+        );
     }
 
     #[test]
     fn a_rebuild_records_inputs_as_they_were_when_checked() {
         let p = project();
-        let mut outputs = built(&p);
+        let mut state = built(&p);
         let inputs = [p.source.clone(), p.header.clone()];
         fs::write(&p.source, "int a(); // edited").unwrap();
-        assert!(!outputs.is_fresh(&p.object, command("cc"), &inputs));
+        assert!(!state.outputs.is_fresh(&p.object, command("cc"), &inputs));
         // The source changes again while the compile runs, after it was read.
         fs::write(&p.source, "int a(); // edited twice").unwrap();
-        outputs.record(&p.object, command("cc"), &inputs);
-        outputs.save_if_changed().unwrap();
+        state.outputs.record(&p.object, command("cc"), &inputs);
+        state.save().unwrap();
 
-        let (mut next, _) = Outputs::load(&p.record);
+        let mut next = p.load();
         assert!(
-            !next.is_fresh(&p.object, command("cc"), &inputs),
+            !next.outputs.is_fresh(&p.object, command("cc"), &inputs),
             "the second edit wasn't compiled, so the next build must rebuild"
         );
     }
@@ -392,21 +467,11 @@ mod tests {
     #[test]
     fn an_output_written_this_build_is_checked_again() {
         let p = project();
-        let mut outputs = built(&p);
+        let mut state = built(&p);
         let inputs = [p.source.clone(), p.header.clone()];
-        assert!(outputs.is_fresh(&p.object, command("cc"), &inputs));
+        assert!(state.outputs.is_fresh(&p.object, command("cc"), &inputs));
         fs::write(&p.header, "#pragma once\n// rewritten by a step").unwrap();
-        outputs.invalidate(&p.header);
-        assert!(!outputs.is_fresh(&p.object, command("cc"), &inputs));
-    }
-
-    #[test]
-    fn a_corrupt_record_is_discarded() {
-        let p = project();
-        fs::create_dir_all(p.record.parent().unwrap()).unwrap();
-        fs::write(&p.record, "[").unwrap();
-        let (mut outputs, error) = Outputs::load(&p.record);
-        assert!(matches!(error, Some(StoreError::Invalid { .. })));
-        assert!(!outputs.is_fresh(&p.object, command("cc"), std::slice::from_ref(&p.source)));
+        state.outputs.invalidate(&p.header);
+        assert!(!state.outputs.is_fresh(&p.object, command("cc"), &inputs));
     }
 }
