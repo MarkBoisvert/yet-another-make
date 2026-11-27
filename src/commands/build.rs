@@ -97,10 +97,9 @@ pub fn run(args: &BuildArgs) -> Result<()> {
     let mut caches = Caches::load(&out);
 
     // Every file the last build recorded is about to be checked. Their `stat`s run
-    // on worker threads while this one reads the manifest, walks the sources and
-    // checks the toolchain, so on a no-op build they come almost for free.
+    // on worker threads while this one reads the manifest and walks the sources, so
+    // on a no-op build they come almost for free.
     let mut prefetch = caches.state.outputs.prefetch_plan(jobs);
-    let cached_toolchain = caches.state.toolchain().cloned();
     let state = &mut caches.state;
     let prepared = std::thread::scope(|scope| {
         let workers = state.outputs.prefetch_spawn(scope, &mut prefetch);
@@ -122,8 +121,7 @@ pub fn run(args: &BuildArgs) -> Result<()> {
                 );
             }
             let targets = select(resolve_targets(&manifest, &root)?, args)?;
-            let toolchain = Toolchain::discover_cached(cached_toolchain.as_ref())?;
-            Ok((manifest, tree, targets, toolchain))
+            Ok((manifest, tree, targets))
         })();
         for worker in workers {
             // A worker that panicked leaves the rest of its files unchecked, to be
@@ -133,8 +131,11 @@ pub fn run(args: &BuildArgs) -> Result<()> {
         prepared
     });
     caches.state.outputs.prefetch_apply(prefetch);
-    let (manifest, tree, targets, (toolchain, discovered)) = prepared?;
+    let (manifest, tree, targets) = prepared?;
+    // What can be checked without a toolchain is checked first, so a missing or
+    // incomplete toolchain doesn't hide a mistake in the project.
     let selected = select_files(&root, &targets, &tree)?;
+    let (toolchain, discovered) = Toolchain::discover_cached(caches.state.toolchain())?;
     if let Some(discovered) = discovered {
         caches.state.set_toolchain(discovered);
     }

@@ -222,8 +222,8 @@ named in `links`.
   build, so an object that's both a compile's output and the archive's input is
   `stat`ed once. Right after the state file loads, every file the recorded outputs
   name is `stat`ed on up to 8 threads (when there are at least 512 per thread),
-  while the main thread reads the manifest, walks the sources and checks the
-  toolchain; the checks that follow find them done. The workers write into slices
+  while the main thread reads the manifest, walks the sources and resolves the
+  targets; the checks that follow find them done. The workers write into slices
   allocated up front, so they never allocate and the allocator never sets up a heap
   for them. A file a step writes is forgotten and checked again, as before.
 - **A fresh compile isn't put together** (#67). Each target's shared compile flags (`-std`,

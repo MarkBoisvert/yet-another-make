@@ -189,7 +189,8 @@ and the rest of the time they save helps glibc too:
   mimalloc set up a heap per thread. They now write into slices allocated up front.
 - **Prefetch alongside startup.** The `stat`s start right after the state file
   loads and run while the main thread reads the manifest, walks the sources and
-  checks the toolchain, rather than while it waits.
+  resolves the targets, rather than while it waits. The toolchain check stays after
+  the project's own checks, so a broken toolchain can't hide a project error.
 - **A few large buffers.** Every output's inputs share one buffer, as do every
   object's header ids, each allocated once at its final size; growing them as they
   filled moved them into fresh memory each time. Scan results' module names are
